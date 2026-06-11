@@ -145,8 +145,17 @@ def cleanup_cache():
         shutil.rmtree(cache_dir)
         print(f"Cache directory '{cache_dir}' has been removed.")
 
+def get_output_dir(lat, lon, nb_cells):
+    lat_str = f"{lat:.6f}".rstrip('0').rstrip('.')
+    lon_str = f"{lon:.6f}".rstrip('0').rstrip('.')
+    return os.path.join("output", f"{lat_str}_{lon_str}_{nb_cells}x{nb_cells}")
+
 def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label):
     try:
+        output_base = get_output_dir(lat, lon, nb_cells)
+        os.makedirs(output_base, exist_ok=True)
+        print(f"Output directory: {output_base}")
+
         status_label.config(text="Downloading OSM data... Please wait.", fg="orange")
         print("Step 1: Downloading OSM data...")
         root.update()
@@ -340,7 +349,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         print("Step 5: Saving complete map image...")
         root.update()
 
-        complete_map_filename = "complete_map.png"
+        complete_map_filename = os.path.join(output_base, "complete_map.png")
         for artist in ax.get_children():
             if hasattr(artist, 'set_antialiased'):
                 artist.set_antialiased(False)
@@ -356,7 +365,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         img = Image.open(complete_map_filename).convert("RGB")
         img_array = np.array(img)
         veg_array = classify_vegetation_color_vectorized(img_array)
-        complete_veg_filename = "complete_vegetation_map.png"
+        complete_veg_filename = os.path.join(output_base, "complete_vegetation_map.png")
         Image.fromarray(veg_array).save(complete_veg_filename)
         print(f"Complete vegetation map saved: {complete_veg_filename}")
 
@@ -364,8 +373,8 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         print("Step 6: Slicing maps into cells...")
         root.update()
 
-        output_dir = "map_cells"
-        veg_output_dir = "map_vegetation"
+        output_dir = os.path.join(output_base, "map_cells")
+        veg_output_dir = os.path.join(output_base, "map_vegetation")
         for dir_name in [output_dir, veg_output_dir]:
             if os.path.exists(dir_name):
                 shutil.rmtree(dir_name)
@@ -379,15 +388,15 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                 y_start, y_end = row * cell_px, (row + 1) * cell_px
                 x_start, x_end = col * cell_px, (col + 1) * cell_px
                 cell_img = img_array[y_start:y_end, x_start:x_end]
-                Image.fromarray(cell_img).save(f"{output_dir}/{col},{row}.png")
+                Image.fromarray(cell_img).save(os.path.join(output_dir, f"{col},{row}.png"))
                 veg_cell_img = veg_img_array[y_start:y_end, x_start:x_end]
-                Image.fromarray(veg_cell_img).save(f"{veg_output_dir}/{col},{row}_veg.png")
+                Image.fromarray(veg_cell_img).save(os.path.join(veg_output_dir, f"{col},{row}_veg.png"))
 
         print(f"Complete files kept:")
         print(f"  - Normal map: {complete_map_filename}")
         print(f"  - Vegetation map: {complete_veg_filename}")
 
-        status_label.config(text=f"{nb_cells}x{nb_cells} grids generated. Complete maps saved as 'complete_map.png' and 'complete_vegetation_map.png'.", fg="#004d00")
+        status_label.config(text=f"{nb_cells}x{nb_cells} grids generated in '{output_base}'.", fg="#004d00")
         print(f"Map grid generation completed: {nb_cells}x{nb_cells} tiles saved in '{output_dir}' and '{veg_output_dir}'.")
         print(f"Complete maps also available as '{complete_map_filename}' and '{complete_veg_filename}'.")
 
@@ -396,12 +405,17 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         status_label.config(text="Error during map generation.", fg="red")
         print(f"ERROR during map generation: {e}")
 
-def generate_vegetation_maps(status_label):
+def generate_vegetation_maps(lat, lon, nb_cells, status_label):
     try:
+        output_base = get_output_dir(lat, lon, nb_cells)
+        input_dir = os.path.join(output_base, "map_cells")
+        output_dir = os.path.join(output_base, "map_vegetation")
+
+        if not os.path.isdir(input_dir):
+            raise FileNotFoundError(f"No map cells found in '{input_dir}'. Generate maps first.")
+
         status_label.config(text="Starting vegetation map generation...", fg="orange")
         print("Vegetation: start processing images.")
-        input_dir = "map_cells"
-        output_dir = "map_vegetation"
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
@@ -480,7 +494,14 @@ def on_generate_maps():
         status_label.config(text="Parameter error.", fg="red")
 
 def on_generate_vegetation():
-    generate_vegetation_maps(status_label)
+    try:
+        lat = float(lat_entry.get())
+        lon = float(lon_entry.get())
+        n = int(cells_entry.get())
+        generate_vegetation_maps(lat, lon, n, status_label)
+    except Exception as e:
+        showerror("Error", f"Invalid parameter: {e}")
+        status_label.config(text="Parameter error.", fg="red")
 
 tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=5, column=0, columnspan=2, pady=5)
 

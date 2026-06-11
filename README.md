@@ -59,7 +59,7 @@ python map_generator.py
 
 ## Output
 
-The tool generates several types of output:
+All generated files are saved under `output/`, in a subfolder named from the coordinates and grid size (e.g. `output/47.803288_-3.720999_2x2/`). Running the tool again with the same parameters overwrites that folder; different locations or grid sizes get their own folder.
 
 ### Complete Maps (Full Resolution)
 * `complete_map.png` — Full resolution simplified map of the entire downloaded area

@@ -1,8 +1,5 @@
 # Generated maps (exclude from repository)
-complete_map.png
-complete_vegetation_map.png
-map_cells/
-map_vegetation/
+output/
 
 # Cache files
 cache/
