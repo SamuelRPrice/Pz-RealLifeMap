@@ -681,7 +681,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         gc.collect()
 
         complete_map_filename = os.path.join(output_base, "complete_map.png")
-        complete_veg_filename = os.path.join(output_base, "complete_vegetation_map.png")
+        complete_veg_filename = os.path.join(output_base, "complete_map_veg.png")
         complete_cells = count_complete_cells(output_dir, veg_output_dir, nb_cells)
         if total_map_px <= MAX_COMPLETE_MAP_PX and complete_cells == total_cells:
             status_label.config(text="Stitching complete preview maps...", fg="orange")
