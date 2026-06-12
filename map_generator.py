@@ -57,6 +57,9 @@ MIN_DOWNLOAD_MARGIN_M = 300
 MAX_DOWNLOAD_MARGIN_M = 2500
 FEATURE_TAGS = {'natural': True, 'landuse': True, 'waterway': True}
 FEATURE_COLUMNS = ('natural', 'landuse', 'waterway')
+UNDERGROUND_FILTER_COLUMNS = ('tunnel', 'location', 'covered')
+UNDERGROUND_TUNNEL_VALUES = frozenset({'yes', 'true', 'culvert', 'flooded'})
+UNDERGROUND_WATERWAY_TYPES = frozenset({'culvert', 'pressurised', 'pressurized', 'pipe'})
 RAILWAY_WIDTH_M = 4
 RAILWAY_EXCLUDE = frozenset({'abandoned', 'disused', 'razed', 'proposed', 'construction'})
 DRAWABLE_GEOM_TYPES = frozenset({
@@ -298,10 +301,25 @@ def get_feature_tags(render_trains=False):
         tags['railway'] = True
     return tags
 
+def underground_mask(gdf):
+    if gdf.empty:
+        return np.zeros(0, dtype=bool)
+    mask = np.zeros(len(gdf), dtype=bool)
+    if 'tunnel' in gdf.columns:
+        mask |= gdf['tunnel'].astype(str).str.lower().isin(UNDERGROUND_TUNNEL_VALUES).values
+    if 'location' in gdf.columns:
+        mask |= gdf['location'].astype(str).str.lower().eq('underground').values
+    if 'covered' in gdf.columns:
+        mask |= gdf['covered'].astype(str).str.lower().isin({'yes', 'true'}).values
+    if 'waterway' in gdf.columns:
+        mask |= gdf['waterway'].astype(str).str.lower().isin(UNDERGROUND_WATERWAY_TYPES).values
+    return mask
+
 def slim_feature_gdf(gdf, keep_railway=False):
     if gdf.empty:
         return gdf
     keep_cols = ['geometry'] + [c for c in FEATURE_COLUMNS if c in gdf.columns]
+    keep_cols += [c for c in UNDERGROUND_FILTER_COLUMNS if c in gdf.columns]
     if keep_railway and 'railway' in gdf.columns:
         keep_cols.append('railway')
     gdf = gdf[keep_cols].copy()
@@ -343,6 +361,7 @@ def prepare_feature_layers(gdf_features_utm):
             if col in polys.columns:
                 sand_mask = polys[col].astype(str).str.lower().isin(['sand', 'beach'])
                 polys.loc[sand_mask, 'is_sand'] = True
+        polys.loc[underground_mask(polys), 'is_water'] = False
 
     if not lines.empty:
         lines['is_water_line'] = False
@@ -352,6 +371,7 @@ def prepare_feature_layers(gdf_features_utm):
                     'coastline', 'river', 'stream', 'canal', 'ditch'
                 ])
                 lines.loc[water_line_mask, 'is_water_line'] = True
+        lines.loc[underground_mask(lines), 'is_water_line'] = False
 
     return polys, lines
 
