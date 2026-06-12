@@ -56,6 +56,8 @@ MIN_DOWNLOAD_MARGIN_M = 300
 MAX_DOWNLOAD_MARGIN_M = 2500
 FEATURE_TAGS = {'natural': True, 'landuse': True, 'waterway': True}
 FEATURE_COLUMNS = ('natural', 'landuse', 'waterway')
+RAILWAY_WIDTH_M = 4
+RAILWAY_EXCLUDE = frozenset({'abandoned', 'disused', 'razed', 'proposed', 'construction'})
 DRAWABLE_GEOM_TYPES = frozenset({
     'Polygon', 'MultiPolygon', 'LineString', 'MultiLineString',
 })
@@ -268,10 +270,18 @@ def build_osm_preview(lat, lon, nb_cells, margin_factor):
 
     return composite
 
-def slim_feature_gdf(gdf):
+def get_feature_tags(render_trains=False):
+    tags = dict(FEATURE_TAGS)
+    if render_trains:
+        tags['railway'] = True
+    return tags
+
+def slim_feature_gdf(gdf, keep_railway=False):
     if gdf.empty:
         return gdf
     keep_cols = ['geometry'] + [c for c in FEATURE_COLUMNS if c in gdf.columns]
+    if keep_railway and 'railway' in gdf.columns:
+        keep_cols.append('railway')
     gdf = gdf[keep_cols].copy()
     geom_mask = gdf.geometry.type.isin(DRAWABLE_GEOM_TYPES)
     return gdf.loc[geom_mask].reset_index(drop=True)
@@ -323,8 +333,30 @@ def prepare_feature_layers(gdf_features_utm):
 
     return polys, lines
 
+def prepare_railway_lines(gdf_features_utm):
+    line_types = ['LineString', 'MultiLineString']
+    lines = gdf_features_utm[gdf_features_utm.geometry.type.isin(line_types)]
+    if lines.empty or 'railway' not in lines.columns:
+        return lines.iloc[0:0].copy()
+    railways = lines[lines['railway'].notna()].copy()
+    railways = railways[~railways['railway'].astype(str).str.lower().isin(RAILWAY_EXCLUDE)]
+    if railways.empty:
+        return railways
+    return railways[['geometry', 'railway']]
+
+def plot_line_geometry(ax, geometry, color, linewidth, zorder):
+    if geometry.geom_type == 'LineString':
+        parts = [geometry]
+    elif geometry.geom_type == 'MultiLineString':
+        parts = geometry.geoms
+    else:
+        return
+    for part in parts:
+        x, y = part.xy
+        ax.plot(x, y, color=color, linewidth=linewidth, solid_capstyle='round', zorder=zorder)
+
 def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale):
+                  meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
     ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
                            facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
 
@@ -367,6 +399,14 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
             except Exception as e:
                 print(f"Error drawing a water line: {e}")
 
+    if render_trains and cell_railways is not None and not cell_railways.empty:
+        railway_lw = max((RAILWAY_WIDTH_M / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
+        for _, row in cell_railways.iterrows():
+            try:
+                plot_line_geometry(ax, row.geometry, PALETTE['gravel_dirt'], railway_lw, zorder=3)
+            except Exception as e:
+                print(f"Error drawing a railway line: {e}")
+
     for _, _, row in cell_roads:
         highway = row.get('highway')
         surface = row.get('surface')
@@ -385,11 +425,11 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
     ax.set_aspect('equal')
 
 def render_cell(output_path, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                meters_per_pixel, road_width_scale):
+                meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
     fig, ax = plt.subplots(figsize=(CELL_PX / RENDER_DPI, CELL_PX / RENDER_DPI), dpi=RENDER_DPI)
     fig.subplots_adjust(0, 0, 1, 1)
     draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale)
+                  meters_per_pixel, road_width_scale, cell_railways, render_trains)
     for artist in ax.get_children():
         if hasattr(artist, 'set_antialiased'):
             artist.set_antialiased(False)
@@ -452,7 +492,7 @@ def count_complete_cells(output_dir, veg_output_dir, nb_cells):
     return complete
 
 def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label,
-                      resume=False, output_name=None):
+                      resume=False, output_name=None, render_trains=False):
     try:
         output_base = get_output_dir(lat, lon, nb_cells, output_name)
         os.makedirs(output_base, exist_ok=True)
@@ -481,13 +521,14 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         print(f"Roads downloaded: {len(gdf_edges)}")
 
         status_label.config(text="Downloading map features...", fg="orange")
-        print("Step 2: Downloading map features (terrain/water only)...")
+        feature_desc = "terrain/water/railways" if render_trains else "terrain/water"
+        print(f"Step 2: Downloading map features ({feature_desc})...")
         root.update()
 
-        gdf_features = ox.features_from_point((lat, lon), tags=FEATURE_TAGS, dist=dist)
+        gdf_features = ox.features_from_point((lat, lon), tags=get_feature_tags(render_trains), dist=dist)
         print(f"Features downloaded: {len(gdf_features)}")
-        gdf_features = slim_feature_gdf(gdf_features)
-        print(f"Features after filtering to drawable terrain/water: {len(gdf_features)}")
+        gdf_features = slim_feature_gdf(gdf_features, keep_railway=render_trains)
+        print(f"Features after filtering: {len(gdf_features)}")
         gc.collect()
 
         status_label.config(text="Projecting geometries...", fg="orange")
@@ -522,7 +563,9 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         plt.rcParams['lines.antialiased'] = False
 
         polys, lines = prepare_feature_layers(gdf_features_utm)
-        print(f"Prepared {len(polys)} polygons, {len(lines)} lines, {len(gdf_edges_utm)} roads")
+        gdf_railways_utm = prepare_railway_lines(gdf_features_utm) if render_trains else None
+        railway_count = len(gdf_railways_utm) if gdf_railways_utm is not None else 0
+        print(f"Prepared {len(polys)} polygons, {len(lines)} lines, {len(gdf_edges_utm)} roads, {railway_count} railways")
 
         output_dir = os.path.join(output_base, "map_cells")
         veg_output_dir = os.path.join(output_base, "map_vegetation")
@@ -568,13 +611,15 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                 cell_polys = filter_gdf_by_box(polys, cell_bbox)
                 cell_lines = filter_gdf_by_box(lines, cell_bbox)
                 cell_roads = get_roads_for_cell(gdf_edges_utm, cell_bbox)
+                cell_railways = filter_gdf_by_box(gdf_railways_utm, cell_bbox) if render_trains else None
 
                 if resume and os.path.isfile(map_cell_path) and os.path.getsize(map_cell_path) > 0:
                     print(f"Reusing map tile for ({col},{row}), generating vegetation only")
                 else:
                     render_cell(
                         map_cell_path, cell_xmin, cell_ymin, cell_xmax, cell_ymax,
-                        cell_polys, cell_lines, cell_roads, meters_per_pixel, road_width_scale
+                        cell_polys, cell_lines, cell_roads, meters_per_pixel, road_width_scale,
+                        cell_railways, render_trains,
                     )
 
                 with Image.open(map_cell_path) as cell_img:
@@ -591,7 +636,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                     gc.collect()
                 root.update()
 
-        del polys, lines, gdf_features_utm, gdf_edges_utm
+        del polys, lines, gdf_railways_utm, gdf_features_utm, gdf_edges_utm
         gc.collect()
 
         complete_map_filename = os.path.join(output_base, "complete_map.png")
@@ -799,6 +844,20 @@ for widget in (resume_frame, resume_label, resume_check):
     ))
     widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
 
+trains_var = tk.BooleanVar(value=False)
+trains_frame = tk.Frame(frame)
+trains_frame.grid(row=7, column=0, columnspan=2, sticky='w')
+trains_label = tk.Label(trains_frame, text="Render train lines")
+trains_label.pack(side='left')
+trains_check = tk.Checkbutton(trains_frame, variable=trains_var)
+trains_check.pack(side='left')
+for widget in (trains_frame, trains_label, trains_check):
+    widget.bind("<Enter>", lambda e: status_label.config(
+        text="Draw OSM railway lines on the map using the gravel/dirt colour.",
+        fg="gray",
+    ))
+    widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
+
 def on_generate_maps():
     try:
         lat = float(lat_entry.get())
@@ -807,13 +866,14 @@ def on_generate_maps():
         margin = float(margin_entry.get())
         width_scale = float(width_entry.get())
         resume = resume_var.get()
+        render_trains = trains_var.get()
         output_name = output_name_entry.get()
         if n < 1:
             raise ValueError("Number of cells must be ≥ 1")
         if margin < 0:
             raise ValueError("Margin must be ≥ 0")
         generate_map_grid(lat, lon, n, width_scale, margin, status_label,
-                          resume=resume, output_name=output_name)
+                          resume=resume, output_name=output_name, render_trains=render_trains)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
@@ -829,7 +889,7 @@ def on_generate_vegetation():
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
 
-tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=7, column=0, columnspan=2, pady=5)
+tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=8, column=0, columnspan=2, pady=5)
 
 root.update_idletasks()
 root.minsize(PREVIEW_WIDTH + 40, root.winfo_height())
