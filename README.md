@@ -51,7 +51,7 @@ python map_generator.py
 
 * Choose the **number of cells** per side (e.g., 2 for a 2x2 grid).
 
-* Adjust the percentage size of the **download area** for OpenStreetMap objects. The larger the size, the lower the risk of missing objects due to truncation, but it also increases the resource usage.
+* Adjust the **download margin** as a percentage of map size. It is clamped between 300 m and 2.5 km so large grids do not pull enormous OSM areas into memory. Only terrain and water features are downloaded (not buildings or amenities).
 
 * Adjust the **road width scale** to make roads more or less visible on the generated maps.
 
@@ -79,9 +79,11 @@ Each cell is 300x300 pixels and represents a 300x300 meter area in the real worl
 ## Workflow
 
 1. **Data Download**: Downloads OpenStreetMap data for roads, natural features, landuse, water bodies, etc.
-2. **Map Rendering**: Creates a complete simplified map using Project Zomboid's color palette
-3. **Vegetation Processing**: Generates a vegetation classification map from the simplified map
-4. **Cell Division**: Splits both complete maps into individual tiles for use in map editors
+2. **Cell Rendering**: Renders each 300×300 m tile individually using Project Zomboid's color palette (keeps memory use low on large grids)
+3. **Vegetation Processing**: Classifies vegetation per tile from the simplified map
+4. **Preview Stitching**: Assembles full-area preview images when the grid is small enough; very large grids keep only the per-cell tiles
+
+Large grids (roughly 66×66 cells and above) skip the full `complete_map.png` preview to avoid loading the entire image into RAM. The individual tiles in `map_cells/` and `map_vegetation/` are always generated.
 
 ## Known issues
 

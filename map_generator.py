@@ -1,12 +1,16 @@
+import gc
 import os
 import shutil
 import tkinter as tk
 from tkinter.messagebox import showerror
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from PIL import Image
 import numpy as np
 import osmnx as ox
+from shapely.geometry import box
 
 
 
@@ -36,6 +40,19 @@ VEGETATION_COLORS = {
     'trees_and_grass': (64, 0, 0),
     'light_long_grass': (0, 255, 0),
 }
+
+CELL_SIZE_M = 300
+CELL_PX = 300
+RENDER_DPI = 100
+# Skip stitching full preview images above this side length (~1.2 GB RGB at 20k px).
+MAX_COMPLETE_MAP_PX = 20000
+MIN_DOWNLOAD_MARGIN_M = 300
+MAX_DOWNLOAD_MARGIN_M = 2500
+FEATURE_TAGS = {'natural': True, 'landuse': True, 'waterway': True}
+FEATURE_COLUMNS = ('natural', 'landuse', 'waterway')
+DRAWABLE_GEOM_TYPES = frozenset({
+    'Polygon', 'MultiPolygon', 'LineString', 'MultiLineString',
+})
 
 
 
@@ -127,17 +144,166 @@ def get_road_priority(highway):
 
 # ========== VEGETATION MAP ==========
 def classify_vegetation_color_vectorized(img_array):
-    ref_colors = np.array(list(PALETTE_ORIG.values()))
-    veg_colors = np.array(list(VEGETATION_COLORS.values()))
-    h, w, c = img_array.shape
-    img_flat = img_array.reshape(-1, 3)
-    distances = np.sqrt(np.sum((img_flat[:, np.newaxis, :] - ref_colors[np.newaxis, :, :]) ** 2, axis=2))
-    closest_indices = np.argmin(distances, axis=1)
-    min_distances = np.min(distances, axis=1)
-    valid_mask = min_distances < 17
-    result = np.zeros((h * w, 3), dtype=np.uint8)
-    result[valid_mask] = veg_colors[closest_indices[valid_mask]]
-    return result.reshape(h, w, 3)
+    ref_colors = np.array(list(PALETTE_ORIG.values()), dtype=np.int16)
+    veg_colors = np.array(list(VEGETATION_COLORS.values()), dtype=np.uint8)
+    h, w, _ = img_array.shape
+    result = np.zeros((h, w, 3), dtype=np.uint8)
+    threshold_sq = 17 * 17
+    chunk_rows = 64
+    for y0 in range(0, h, chunk_rows):
+        y1 = min(y0 + chunk_rows, h)
+        chunk = img_array[y0:y1].astype(np.int16)
+        diff = chunk[:, :, np.newaxis, :] - ref_colors[np.newaxis, np.newaxis, :, :]
+        dist_sq = np.sum(diff * diff, axis=3)
+        closest = np.argmin(dist_sq, axis=2)
+        valid = np.min(dist_sq, axis=2) < threshold_sq
+        chunk_result = np.zeros((y1 - y0, w, 3), dtype=np.uint8)
+        chunk_result[valid] = veg_colors[closest[valid]]
+        result[y0:y1] = chunk_result
+    return result
+
+def compute_download_margin_m(total_zone_m, margin_factor):
+    margin_m = total_zone_m * margin_factor
+    return max(MIN_DOWNLOAD_MARGIN_M, min(margin_m, MAX_DOWNLOAD_MARGIN_M))
+
+def slim_feature_gdf(gdf):
+    if gdf.empty:
+        return gdf
+    keep_cols = ['geometry'] + [c for c in FEATURE_COLUMNS if c in gdf.columns]
+    gdf = gdf[keep_cols].copy()
+    geom_mask = gdf.geometry.type.isin(DRAWABLE_GEOM_TYPES)
+    return gdf.loc[geom_mask].reset_index(drop=True)
+
+def filter_gdf_by_box(gdf, bbox):
+    if gdf.empty:
+        return gdf
+    indices = gdf.sindex.query(bbox, predicate='intersects')
+    return gdf.iloc[list(indices)]
+
+def get_roads_for_cell(gdf_edges_utm, bbox):
+    if gdf_edges_utm.empty:
+        return []
+    indices = gdf_edges_utm.sindex.query(bbox, predicate='intersects')
+    if len(indices) == 0:
+        return []
+    roads = []
+    for idx, row in gdf_edges_utm.iloc[list(indices)].iterrows():
+        highway = row.get('highway')
+        if highway:
+            roads.append((get_road_priority(highway), idx, row))
+    roads.sort(key=lambda x: x[0])
+    return roads
+
+def prepare_feature_layers(gdf_features_utm):
+    polys = gdf_features_utm[gdf_features_utm.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
+    lines = gdf_features_utm[gdf_features_utm.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
+
+    if not polys.empty:
+        polys['is_water'] = False
+        polys['is_sand'] = False
+        for col in ['natural', 'waterway', 'landuse']:
+            if col in polys.columns:
+                water_mask = polys[col].astype(str).str.lower().isin(['water', 'wetland', 'bay', 'reservoir'])
+                polys.loc[water_mask, 'is_water'] = True
+        for col in ['natural', 'landuse']:
+            if col in polys.columns:
+                sand_mask = polys[col].astype(str).str.lower().isin(['sand', 'beach'])
+                polys.loc[sand_mask, 'is_sand'] = True
+
+    if not lines.empty:
+        lines['is_water_line'] = False
+        for col in ['natural', 'waterway']:
+            if col in lines.columns:
+                water_line_mask = lines[col].astype(str).str.lower().isin([
+                    'coastline', 'river', 'stream', 'canal', 'ditch'
+                ])
+                lines.loc[water_line_mask, 'is_water_line'] = True
+
+    return polys, lines
+
+def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
+                  meters_per_pixel, road_width_scale):
+    ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
+                           facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
+
+    if not cell_polys.empty:
+        for col, func in [('natural', get_natural_color), ('landuse', get_landuse_color)]:
+            if col in cell_polys.columns:
+                colors = cell_polys[col].apply(func)
+                mask = colors.notna()
+                if col == 'natural':
+                    water_mask = cell_polys[col].astype(str).str.lower().isin(['water', 'wetland', 'bay', 'coastline'])
+                    mask = mask & ~water_mask
+                if mask.any():
+                    cell_polys[mask].plot(ax=ax, color=colors[mask], linewidth=0, zorder=1)
+
+        if 'is_water' in cell_polys.columns:
+            water_polys = cell_polys[cell_polys['is_water']]
+            if not water_polys.empty:
+                water_polys.plot(ax=ax, color=PALETTE['water'], linewidth=0, zorder=2)
+
+        if 'is_sand' in cell_polys.columns:
+            sand_polys = cell_polys[cell_polys['is_sand']]
+            if not sand_polys.empty:
+                sand_polys.plot(ax=ax, color=PALETTE['sand'], linewidth=0, zorder=3)
+
+    if not cell_lines.empty and 'is_water_line' in cell_lines.columns:
+        water_line_features = cell_lines[cell_lines['is_water_line']]
+        for _, row in water_line_features.iterrows():
+            waterway_type = row.get('waterway', '')
+            natural_type = row.get('natural', '')
+            if natural_type == 'coastline':
+                lw = 4
+            elif waterway_type in ['river', 'canal']:
+                lw = 3
+            else:
+                lw = 2
+            try:
+                if hasattr(row.geometry, 'xy'):
+                    x, y = row.geometry.xy
+                    ax.plot(x, y, color=PALETTE['water'], linewidth=lw, solid_capstyle='round', zorder=2)
+            except Exception as e:
+                print(f"Error drawing a water line: {e}")
+
+    for _, _, row in cell_roads:
+        highway = row.get('highway')
+        surface = row.get('surface')
+        color = get_road_color(highway, surface)
+        width_m = get_road_width_m(highway)
+        lw = max((width_m / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
+        try:
+            x, y = row.geometry.xy
+            ax.plot(x, y, color=color, linewidth=lw, solid_capstyle='round', zorder=4)
+        except Exception as e:
+            print(f"Error drawing a road: {e}")
+
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_axis_off()
+    ax.set_aspect('equal')
+
+def render_cell(output_path, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
+                meters_per_pixel, road_width_scale):
+    fig, ax = plt.subplots(figsize=(CELL_PX / RENDER_DPI, CELL_PX / RENDER_DPI), dpi=RENDER_DPI)
+    fig.subplots_adjust(0, 0, 1, 1)
+    draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
+                  meters_per_pixel, road_width_scale)
+    for artist in ax.get_children():
+        if hasattr(artist, 'set_antialiased'):
+            artist.set_antialiased(False)
+    plt.savefig(output_path, dpi=RENDER_DPI, pad_inches=0, bbox_inches='tight')
+    plt.close(fig)
+
+def stitch_cells(cells_dir, nb_cells, filename_fn, output_path):
+    total_px = CELL_PX * nb_cells
+    complete = Image.new('RGB', (total_px, total_px))
+    for row in range(nb_cells):
+        for col in range(nb_cells):
+            cell_path = os.path.join(cells_dir, filename_fn(col, row))
+            with Image.open(cell_path) as cell_img:
+                complete.paste(cell_img.convert('RGB'), (col * CELL_PX, row * CELL_PX))
+    complete.save(output_path)
+    complete.close()
 
 def cleanup_cache():
     cache_dir = "cache"
@@ -150,7 +316,27 @@ def get_output_dir(lat, lon, nb_cells):
     lon_str = f"{lon:.6f}".rstrip('0').rstrip('.')
     return os.path.join("output", f"{lat_str}_{lon_str}_{nb_cells}x{nb_cells}")
 
-def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label):
+def cell_paths(output_dir, veg_output_dir, col, row):
+    map_path = os.path.join(output_dir, f"{col},{row}.png")
+    veg_path = os.path.join(veg_output_dir, f"{col},{row}_veg.png")
+    return map_path, veg_path
+
+def cell_is_complete(map_path, veg_path):
+    return (
+        os.path.isfile(map_path) and os.path.getsize(map_path) > 0
+        and os.path.isfile(veg_path) and os.path.getsize(veg_path) > 0
+    )
+
+def count_complete_cells(output_dir, veg_output_dir, nb_cells):
+    complete = 0
+    for row in range(nb_cells):
+        for col in range(nb_cells):
+            map_path, veg_path = cell_paths(output_dir, veg_output_dir, col, row)
+            if cell_is_complete(map_path, veg_path):
+                complete += 1
+    return complete
+
+def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label, resume=False):
     try:
         output_base = get_output_dir(lat, lon, nb_cells)
         os.makedirs(output_base, exist_ok=True)
@@ -160,41 +346,33 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         print("Step 1: Downloading OSM data...")
         root.update()
 
-        cell_size_m = 300
-        cell_px = 300
-        total_zone_m = cell_size_m * nb_cells
-        margin_m = total_zone_m * max(margin_factor, 0.6)
+        total_zone_m = CELL_SIZE_M * nb_cells
+        margin_m = compute_download_margin_m(total_zone_m, margin_factor)
         download_zone_m = total_zone_m + 2 * margin_m
         dist = download_zone_m / 2
 
         print(f"Rendering zone: {total_zone_m}m x {total_zone_m}m")
-        print(f"Margin applied: {margin_m}m")
-        print(f"Download zone: {download_zone_m}m x {download_zone_m}m")
+        print(f"Download margin: {margin_m:.0f}m (capped at {MAX_DOWNLOAD_MARGIN_M}m for large maps)")
+        print(f"Download zone: {download_zone_m:.0f}m x {download_zone_m:.0f}m")
 
         print("Downloading road network...")
+        simplify_roads = dist > 5000
         G = ox.graph_from_point((lat, lon), dist=dist, network_type='all',
-                                simplify=False, retain_all=True, truncate_by_edge=True)
+                                simplify=simplify_roads, retain_all=True, truncate_by_edge=True)
         gdf_edges = ox.graph_to_gdfs(G, nodes=False)
+        del G
+        gc.collect()
         print(f"Roads downloaded: {len(gdf_edges)}")
 
         status_label.config(text="Downloading map features...", fg="orange")
-        print("Step 2: Downloading map features...")
+        print("Step 2: Downloading map features (terrain/water only)...")
         root.update()
 
-        tags = {
-            'natural': True, 'landuse': True, 'leisure': True,
-            'tourism': True, 'amenity': True, 'building': True,
-            'waterway': True, 'coastline': True, 'water': True,
-            'landcover': True, 'surface': True, 'highway': True,
-            'barrier': True, 'railway': True, 'place': True
-        }
-        try:
-            gdf_features = ox.features_from_point((lat, lon), tags=tags, dist=dist)
-            print(f"Features downloaded: {len(gdf_features)}")
-        except Exception as e:
-            print(f"Warning: Some features could not be downloaded: {e}")
-            simple_tags = {'natural': True, 'landuse': True, 'highway': True, 'waterway': True}
-            gdf_features = ox.features_from_point((lat, lon), tags=simple_tags, dist=dist)
+        gdf_features = ox.features_from_point((lat, lon), tags=FEATURE_TAGS, dist=dist)
+        print(f"Features downloaded: {len(gdf_features)}")
+        gdf_features = slim_feature_gdf(gdf_features)
+        print(f"Features after filtering to drawable terrain/water: {len(gdf_features)}")
+        gc.collect()
 
         status_label.config(text="Projecting geometries...", fg="orange")
         print("Step 3: Projecting geometries...")
@@ -208,197 +386,122 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         center_y = gdf_edges_utm.geometry.centroid.y.mean()
         print(f"Map center: ({center_x:.0f}, {center_y:.0f})")
 
-        total_map_px = cell_px * nb_cells
-        meters_per_pixel = total_zone_m / total_map_px
-
-        dpi = 100
-        plt.rcParams['path.simplify'] = False
-        plt.rcParams['agg.path.chunksize'] = 0
-        plt.rcParams['lines.antialiased'] = False
-        fig, ax = plt.subplots(figsize=(total_map_px/dpi, total_map_px/dpi), dpi=dpi)
-        fig.subplots_adjust(0, 0, 1, 1)
-
         xmin = center_x - total_zone_m / 2
         xmax = center_x + total_zone_m / 2
         ymin = center_y - total_zone_m / 2
         ymax = center_y + total_zone_m / 2
-
         print(f"Rendering zone: x[{xmin:.0f}, {xmax:.0f}], y[{ymin:.0f}, {ymax:.0f}]")
 
-        ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
-                               facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
+        total_bbox = box(xmin, ymin, xmax, ymax)
+        gdf_features_utm = gdf_features_utm.clip(total_bbox)
+        gdf_edges_utm = gdf_edges_utm.clip(total_bbox)
+        del gdf_edges, gdf_features
+        gc.collect()
 
-        status_label.config(text="Drawing roads and features...", fg="orange")
-        print("Step 4: Drawing roads and features...")
-        root.update()
+        total_map_px = CELL_PX * nb_cells
+        meters_per_pixel = total_zone_m / total_map_px
 
-        layer = gdf_features_utm[gdf_features_utm.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
-        if not layer.empty:
-            print(f"Total land objects: {len(layer)}")
-            for col, func in [('natural', get_natural_color), ('landuse', get_landuse_color)]:
-                if col in layer.columns:
-                    colors = layer[col].apply(func)
-                    mask = colors.notna()
-                    if col == 'natural':
-                        water_mask = layer[col].astype(str).str.lower().isin(['water', 'wetland', 'bay', 'coastline'])
-                        mask = mask & ~water_mask
-                    if mask.any():
-                        print(f"Rendering {col}: {mask.sum()} objects")
-                        layer[mask].plot(ax=ax, color=colors[mask], linewidth=0, zorder=1)
+        plt.rcParams['path.simplify'] = False
+        plt.rcParams['agg.path.chunksize'] = 0
+        plt.rcParams['lines.antialiased'] = False
 
-        water_layer = gdf_features_utm[gdf_features_utm.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
-        if not water_layer.empty:
-            water_layer['is_water'] = False
-            for col in ['natural', 'waterway', 'landuse']:
-                if col in water_layer.columns:
-                    water_mask = water_layer[col].astype(str).str.lower().isin([
-                        'water', 'wetland', 'bay', 'reservoir'
-                    ])
-                    water_layer.loc[water_mask, 'is_water'] = True
-            if 'is_water' in water_layer.columns:
-                water_polys = water_layer[water_layer['is_water']]
-                if not water_polys.empty:
-                    print(f"Water objects (polygons): {len(water_polys)}")
-                    water_polys.plot(ax=ax, color=PALETTE['water'], linewidth=0, zorder=2)
-
-        water_lines = gdf_features_utm[gdf_features_utm.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
-        if not water_lines.empty:
-            water_lines['is_water_line'] = False
-            for col in ['natural', 'waterway']:
-                if col in water_lines.columns:
-                    water_line_mask = water_lines[col].astype(str).str.lower().isin([
-                        'coastline', 'river', 'stream', 'canal', 'ditch'
-                    ])
-                    water_lines.loc[water_line_mask, 'is_water_line'] = True
-            water_line_features = water_lines[water_lines['is_water_line']]
-            if not water_line_features.empty:
-                print(f"Water objects (lines): {len(water_line_features)}")
-                for _, row in water_line_features.iterrows():
-                    waterway_type = row.get('waterway', '')
-                    natural_type = row.get('natural', '')
-                    if natural_type == 'coastline':
-                        lw = 4
-                    elif waterway_type in ['river', 'canal']:
-                        lw = 3
-                    else:
-                        lw = 2
-                    try:
-                        if hasattr(row.geometry, 'xy'):
-                            x, y = row.geometry.xy
-                            ax.plot(x, y, color=PALETTE['water'], linewidth=lw, solid_capstyle='round', zorder=2)
-                    except Exception as e:
-                        print(f"Error drawing a water line: {e}")
-
-        sand_layer = gdf_features_utm[gdf_features_utm.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
-        if not sand_layer.empty:
-            sand_layer['is_sand'] = False
-            for col in ['natural', 'landuse']:
-                if col in sand_layer.columns:
-                    sand_mask = sand_layer[col].astype(str).str.lower().isin(['sand', 'beach'])
-                    sand_layer.loc[sand_mask, 'is_sand'] = True
-            if 'is_sand' in sand_layer.columns:
-                sand_polys = sand_layer[sand_layer['is_sand']]
-                if not sand_polys.empty:
-                    print(f"Sand objects: {len(sand_polys)}")
-                    sand_polys.plot(ax=ax, color=PALETTE['sand'], linewidth=0, zorder=3)
-
-
-
-
-        # ========== TRI DES ROUTES PAR IMPORTANCE ==========
-        print(f"Sorting and drawing roads: {len(gdf_edges_utm)} roads")
-        
-        roads_to_draw = []
-        for idx, row in gdf_edges_utm.iterrows():
-            highway = row.get('highway')
-            if highway:
-                priority = get_road_priority(highway)
-                roads_to_draw.append((priority, idx, row))
-        
-        roads_to_draw.sort(key=lambda x: x[0])
-        
-        print(f"Roads sorted by priority, drawing {len(roads_to_draw)} roads...")
-        routes_drawn = 0
-        
-        for priority, idx, row in roads_to_draw:
-            highway = row.get('highway')
-            surface = row.get('surface')
-            color = get_road_color(highway, surface)
-            width_m = get_road_width_m(highway)
-            lw = max((width_m / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
-            try:
-                x, y = row.geometry.xy
-                ax.plot(x, y, color=color, linewidth=lw, solid_capstyle='round', zorder=4)
-                routes_drawn += 1
-            except Exception as e:
-                print(f"Error drawing a road: {e}")
-                continue
-        
-        print(f"Roads drawn: {routes_drawn}")
-
-
-
-
-
-        ax.set_xlim(xmin, xmax)
-        ax.set_ylim(ymin, ymax)
-        ax.set_axis_off()
-        ax.set_aspect('equal')
-
-        status_label.config(text="Saving complete map image...", fg="orange")
-        print("Step 5: Saving complete map image...")
-        root.update()
-
-        complete_map_filename = os.path.join(output_base, "complete_map.png")
-        for artist in ax.get_children():
-            if hasattr(artist, 'set_antialiased'):
-                artist.set_antialiased(False)
-
-        plt.savefig(complete_map_filename, dpi=dpi, pad_inches=0, bbox_inches='tight')
-        plt.close()
-        print(f"Complete map saved: {complete_map_filename}")
-
-        status_label.config(text="Processing complete vegetation map...", fg="orange")
-        print("Step 5.5: Processing complete vegetation map...")
-        root.update()
-
-        img = Image.open(complete_map_filename).convert("RGB")
-        img_array = np.array(img)
-        veg_array = classify_vegetation_color_vectorized(img_array)
-        complete_veg_filename = os.path.join(output_base, "complete_vegetation_map.png")
-        Image.fromarray(veg_array).save(complete_veg_filename)
-        print(f"Complete vegetation map saved: {complete_veg_filename}")
-
-        status_label.config(text="Slicing maps into cells...", fg="orange")
-        print("Step 6: Slicing maps into cells...")
-        root.update()
+        polys, lines = prepare_feature_layers(gdf_features_utm)
+        print(f"Prepared {len(polys)} polygons, {len(lines)} lines, {len(gdf_edges_utm)} roads")
 
         output_dir = os.path.join(output_base, "map_cells")
         veg_output_dir = os.path.join(output_base, "map_vegetation")
-        for dir_name in [output_dir, veg_output_dir]:
-            if os.path.exists(dir_name):
-                shutil.rmtree(dir_name)
-            os.makedirs(dir_name, exist_ok=True)
+        if resume:
+            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(veg_output_dir, exist_ok=True)
+        else:
+            for dir_name in [output_dir, veg_output_dir]:
+                if os.path.exists(dir_name):
+                    shutil.rmtree(dir_name)
+                os.makedirs(dir_name, exist_ok=True)
 
-        veg_img = Image.open(complete_veg_filename)
-        veg_img_array = np.array(veg_img)
+        total_cells = nb_cells * nb_cells
+        if resume:
+            existing_cells = count_complete_cells(output_dir, veg_output_dir, nb_cells)
+            print(f"Resume mode: {existing_cells}/{total_cells} cells already complete")
+
+        status_label.config(text="Rendering map cells...", fg="orange")
+        print(f"Step 4: Rendering {total_cells} cells one at a time...")
+        root.update()
 
         for row in range(nb_cells):
             for col in range(nb_cells):
-                y_start, y_end = row * cell_px, (row + 1) * cell_px
-                x_start, x_end = col * cell_px, (col + 1) * cell_px
-                cell_img = img_array[y_start:y_end, x_start:x_end]
-                Image.fromarray(cell_img).save(os.path.join(output_dir, f"{col},{row}.png"))
-                veg_cell_img = veg_img_array[y_start:y_end, x_start:x_end]
-                Image.fromarray(veg_cell_img).save(os.path.join(veg_output_dir, f"{col},{row}_veg.png"))
+                cell_index = row * nb_cells + col + 1
+                map_cell_path, veg_cell_path = cell_paths(output_dir, veg_output_dir, col, row)
 
-        print(f"Complete files kept:")
-        print(f"  - Normal map: {complete_map_filename}")
-        print(f"  - Vegetation map: {complete_veg_filename}")
+                if resume and cell_is_complete(map_cell_path, veg_cell_path):
+                    status_label.config(
+                        text=f"Skipped cell {cell_index}/{total_cells} ({col},{row}) — already done",
+                        fg="orange"
+                    )
+                    if cell_index % 10 == 0 or cell_index == total_cells:
+                        print(f"Skipped cell {cell_index}/{total_cells}: ({col},{row})")
+                    root.update()
+                    continue
+
+                cell_xmin = xmin + col * CELL_SIZE_M
+                cell_xmax = cell_xmin + CELL_SIZE_M
+                cell_ymax = ymax - row * CELL_SIZE_M
+                cell_ymin = cell_ymax - CELL_SIZE_M
+                cell_bbox = box(cell_xmin, cell_ymin, cell_xmax, cell_ymax)
+
+                cell_polys = filter_gdf_by_box(polys, cell_bbox)
+                cell_lines = filter_gdf_by_box(lines, cell_bbox)
+                cell_roads = get_roads_for_cell(gdf_edges_utm, cell_bbox)
+
+                if resume and os.path.isfile(map_cell_path) and os.path.getsize(map_cell_path) > 0:
+                    print(f"Reusing map tile for ({col},{row}), generating vegetation only")
+                else:
+                    render_cell(
+                        map_cell_path, cell_xmin, cell_ymin, cell_xmax, cell_ymax,
+                        cell_polys, cell_lines, cell_roads, meters_per_pixel, road_width_scale
+                    )
+
+                with Image.open(map_cell_path) as cell_img:
+                    veg_array = classify_vegetation_color_vectorized(np.array(cell_img.convert('RGB')))
+                Image.fromarray(veg_array).save(veg_cell_path)
+
+                status_label.config(
+                    text=f"Rendered cell {cell_index}/{total_cells} ({col},{row})...",
+                    fg="orange"
+                )
+                if cell_index % 10 == 0 or cell_index == total_cells:
+                    print(f"Rendered cell {cell_index}/{total_cells}: ({col},{row})")
+                if cell_index % 100 == 0:
+                    gc.collect()
+                root.update()
+
+        del polys, lines, gdf_features_utm, gdf_edges_utm
+        gc.collect()
+
+        complete_map_filename = os.path.join(output_base, "complete_map.png")
+        complete_veg_filename = os.path.join(output_base, "complete_vegetation_map.png")
+        complete_cells = count_complete_cells(output_dir, veg_output_dir, nb_cells)
+        if total_map_px <= MAX_COMPLETE_MAP_PX and complete_cells == total_cells:
+            status_label.config(text="Stitching complete preview maps...", fg="orange")
+            print("Step 5: Stitching complete preview maps...")
+            root.update()
+            stitch_cells(output_dir, nb_cells, lambda c, r: f"{c},{r}.png", complete_map_filename)
+            stitch_cells(veg_output_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", complete_veg_filename)
+            print(f"Complete map saved: {complete_map_filename}")
+            print(f"Complete vegetation map saved: {complete_veg_filename}")
+        elif total_map_px > MAX_COMPLETE_MAP_PX:
+            print(
+                f"Skipping complete preview maps ({total_map_px}px exceeds {MAX_COMPLETE_MAP_PX}px limit). "
+                f"Individual tiles are in '{output_dir}' and '{veg_output_dir}'."
+            )
+        else:
+            print(
+                f"Skipping complete preview maps ({complete_cells}/{total_cells} cells ready). "
+                "Enable resume and run again to finish remaining tiles."
+            )
 
         status_label.config(text=f"{nb_cells}x{nb_cells} grids generated in '{output_base}'.", fg="#004d00")
-        print(f"Map grid generation completed: {nb_cells}x{nb_cells} tiles saved in '{output_dir}' and '{veg_output_dir}'.")
-        print(f"Complete maps also available as '{complete_map_filename}' and '{complete_veg_filename}'.")
+        print(f"Map grid generation completed: {complete_cells}/{total_cells} tiles in '{output_dir}' and '{veg_output_dir}'.")
 
     except Exception as e:
         showerror("Error", f"Map generation error: {e}")
@@ -456,14 +559,24 @@ root.title("OSM + Vegetation Map Generator")
 frame = tk.Frame(root, padx=10, pady=10)
 frame.pack()
 
+STATUS_WRAP = 380
+status_frame = tk.Frame(root, height=64)
+status_frame.pack(fill='x', padx=10, pady=5)
+status_frame.pack_propagate(False)
+status_label = tk.Label(
+    status_frame, text="", fg="green", wraplength=STATUS_WRAP,
+    justify='left', anchor='nw',
+)
+status_label.pack(fill='both', expand=True, anchor='w')
+
 def add_entry(label_text, default_value, row, tooltip=None):
     tk.Label(frame, text=label_text).grid(row=row, column=0, sticky='e')
     entry = tk.Entry(frame, width=25)
     entry.insert(0, str(default_value))
     entry.grid(row=row, column=1)
     if tooltip:
-        def on_enter(event): status_label.config(text=tooltip)
-        def on_leave(event): status_label.config(text="")
+        def on_enter(event): status_label.config(text=tooltip, fg="gray")
+        def on_leave(event): status_label.config(text="", fg="green")
         entry.bind("<Enter>", on_enter)
         entry.bind("<Leave>", on_leave)
     return entry
@@ -473,9 +586,23 @@ lon_entry = add_entry("Longitude:", -3.7209986709586205, 1, "Longitude of the ma
 cells_entry = add_entry("Number of cells (NxN):", 2, 2,
                         "Number of cells per side (e.g., 2 means 4 map tiles).")
 margin_entry = add_entry("Download margin (%):", 0.8, 3,
-                         "Extra area to download around the map zone.")
+                         "Extra download buffer as % of map size (300m–2500m; large maps use the cap).")
 width_entry = add_entry("Road width scale:", 100, 4,
                         "Scale factor for road widths on the generated maps.")
+
+resume_var = tk.BooleanVar(value=False)
+resume_frame = tk.Frame(frame)
+resume_frame.grid(row=5, column=0, columnspan=2, sticky='w')
+resume_label = tk.Label(resume_frame, text="Resume incomplete generation")
+resume_label.pack(side='left')
+resume_check = tk.Checkbutton(resume_frame, variable=resume_var)
+resume_check.pack(side='left')
+for widget in (resume_frame, resume_label, resume_check):
+    widget.bind("<Enter>", lambda e: status_label.config(
+        text="Keep existing tiles and only render missing cells. Uncheck to wipe and start over.",
+        fg="gray",
+    ))
+    widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
 
 def on_generate_maps():
     try:
@@ -484,11 +611,12 @@ def on_generate_maps():
         n = int(cells_entry.get())
         margin = float(margin_entry.get())
         width_scale = float(width_entry.get())
+        resume = resume_var.get()
         if n < 1:
             raise ValueError("Number of cells must be ≥ 1")
         if margin < 0:
             raise ValueError("Margin must be ≥ 0")
-        generate_map_grid(lat, lon, n, width_scale, margin, status_label)
+        generate_map_grid(lat, lon, n, width_scale, margin, status_label, resume=resume)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
@@ -503,9 +631,9 @@ def on_generate_vegetation():
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
 
-tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=5, column=0, columnspan=2, pady=5)
+tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=6, column=0, columnspan=2, pady=5)
 
-status_label = tk.Label(root, text="", fg="green")
-status_label.pack(pady=5)
+root.update_idletasks()
+root.minsize(root.winfo_width(), root.winfo_height())
 
 root.mainloop()
