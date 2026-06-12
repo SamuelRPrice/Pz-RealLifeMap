@@ -12,12 +12,13 @@ from urllib.request import Request, urlopen
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from PIL import Image, ImageDraw, ImageTk
 import geopandas as gpd
 import numpy as np
 import osmnx as ox
-from shapely.geometry import Point, box
+from shapely.geometry import LineString, MultiLineString, Point, box
 
 
 
@@ -62,6 +63,9 @@ UNDERGROUND_TUNNEL_VALUES = frozenset({'yes', 'true', 'culvert', 'flooded'})
 UNDERGROUND_WATERWAY_TYPES = frozenset({'culvert', 'pressurised', 'pressurized', 'pipe'})
 RAILWAY_WIDTH_M = 4
 RAILWAY_EXCLUDE = frozenset({'abandoned', 'disused', 'razed', 'proposed', 'construction'})
+OCTOLINEAR_SIMPLIFY_M = 20
+OCTOLINEAR_JUNCTION_SNAP_M = 12
+OCTOLINEAR_MIN_SEGMENT_M = 3
 DRAWABLE_GEOM_TYPES = frozenset({
     'Polygon', 'MultiPolygon', 'LineString', 'MultiLineString',
 })
@@ -332,6 +336,124 @@ def filter_gdf_by_box(gdf, bbox):
     indices = gdf.sindex.query(bbox, predicate='intersects')
     return gdf.iloc[list(indices)]
 
+def snap_angle_to_45(angle):
+    return round(angle / (math.pi / 4)) * (math.pi / 4)
+
+def iter_linestrings(geometry):
+    if geometry is None or geometry.is_empty:
+        return
+    if geometry.geom_type == 'LineString':
+        yield geometry
+    elif geometry.geom_type == 'MultiLineString':
+        yield from geometry.geoms
+
+def _junction_bucket(point, tolerance_m):
+    return (round(point[0] / tolerance_m), round(point[1] / tolerance_m))
+
+def build_junction_map(geometries, tolerance_m=OCTOLINEAR_JUNCTION_SNAP_M):
+    buckets = {}
+    for geometry in geometries:
+        for line in iter_linestrings(geometry):
+            for point in (line.coords[0], line.coords[-1]):
+                key = _junction_bucket(point, tolerance_m)
+                buckets.setdefault(key, []).append(point)
+    junction_map = {}
+    for key, points in buckets.items():
+        junction_map[key] = (
+            sum(p[0] for p in points) / len(points),
+            sum(p[1] for p in points) / len(points),
+        )
+    return junction_map
+
+def _snap_point_to_junction(point, junction_map, tolerance_m=OCTOLINEAR_JUNCTION_SNAP_M):
+    return junction_map.get(_junction_bucket(point, tolerance_m), point)
+
+def _segment_angle(p0, p1):
+    return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+
+def _angles_match(a, b, tolerance_rad=0.08):
+    delta = abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+    return delta < tolerance_rad
+
+def merge_collinear_coords(coords):
+    if len(coords) < 3:
+        return coords
+    merged = [coords[0]]
+    for i in range(1, len(coords) - 1):
+        prev_angle = _segment_angle(merged[-1], coords[i])
+        next_angle = _segment_angle(coords[i], coords[i + 1])
+        if _angles_match(prev_angle, next_angle):
+            continue
+        merged.append(coords[i])
+    merged.append(coords[-1])
+    return merged
+
+def snap_coords_to_45(coords):
+    if len(coords) < 2:
+        return coords
+    snapped = [coords[0]]
+    for i in range(len(coords) - 1):
+        x0, y0 = snapped[-1]
+        x1, y1 = coords[i + 1]
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length < OCTOLINEAR_MIN_SEGMENT_M:
+            continue
+        angle = snap_angle_to_45(math.atan2(dy, dx))
+        snapped.append((x0 + length * math.cos(angle), y0 + length * math.sin(angle)))
+    return merge_collinear_coords(snapped)
+
+def snap_linestring_to_45(line, junction_map, simplify_tolerance_m=OCTOLINEAR_SIMPLIFY_M):
+    if line is None or line.is_empty:
+        return line
+    simplified = line.simplify(simplify_tolerance_m, preserve_topology=True)
+    coords = list(simplified.coords)
+    if len(coords) < 2:
+        return simplified
+    start = _snap_point_to_junction(coords[0], junction_map)
+    end = _snap_point_to_junction(coords[-1], junction_map)
+    if len(coords) == 2:
+        snapped = snap_coords_to_45([start, end])
+    else:
+        interior = coords[1:-1]
+        snapped = snap_coords_to_45([start, *interior, end])
+    if len(snapped) < 2:
+        return LineString([start, end])
+    snapped[0] = start
+    snapped[-1] = end
+    snapped = merge_collinear_coords(snapped)
+    if len(snapped) < 2:
+        return LineString([start, end])
+    return LineString(snapped)
+
+def snap_geometry_to_45(geometry, junction_map, simplify_tolerance_m=OCTOLINEAR_SIMPLIFY_M):
+    if geometry is None or geometry.is_empty:
+        return geometry
+    if geometry.geom_type == 'LineString':
+        return snap_linestring_to_45(geometry, junction_map, simplify_tolerance_m)
+    if geometry.geom_type == 'MultiLineString':
+        parts = [
+            snap_linestring_to_45(part, junction_map, simplify_tolerance_m)
+            for part in geometry.geoms
+        ]
+        parts = [part for part in parts if not part.is_empty and len(part.coords) >= 2]
+        if not parts:
+            return geometry
+        return MultiLineString(parts)
+    return geometry
+
+def snap_roads_gdf_to_45(gdf_edges_utm):
+    simplified_geoms = [
+        geom.simplify(OCTOLINEAR_SIMPLIFY_M, preserve_topology=True)
+        for geom in gdf_edges_utm.geometry
+    ]
+    junction_map = build_junction_map(simplified_geoms)
+    snapped = gdf_edges_utm.copy()
+    snapped.geometry = [
+        snap_geometry_to_45(geom, junction_map) for geom in gdf_edges_utm.geometry
+    ]
+    return snapped
+
 def get_roads_for_cell(gdf_edges_utm, bbox):
     if gdf_edges_utm.empty:
         return []
@@ -386,7 +508,7 @@ def prepare_railway_lines(gdf_features_utm):
         return railways
     return railways[['geometry', 'railway']]
 
-def plot_line_geometry(ax, geometry, color, linewidth, zorder):
+def plot_line_geometry(ax, geometry, color, linewidth, zorder, antialiased=False):
     if geometry.geom_type == 'LineString':
         parts = [geometry]
     elif geometry.geom_type == 'MultiLineString':
@@ -395,10 +517,14 @@ def plot_line_geometry(ax, geometry, color, linewidth, zorder):
         return
     for part in parts:
         x, y = part.xy
-        ax.plot(x, y, color=color, linewidth=linewidth, solid_capstyle='round', zorder=zorder)
+        ax.plot(
+            x, y, color=color, linewidth=linewidth, solid_capstyle='round',
+            zorder=zorder, antialiased=antialiased,
+        )
 
 def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
+                  meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False,
+                  snap_roads_45=False):
     ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
                            facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
 
@@ -456,8 +582,7 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
         width_m = get_road_width_m(highway)
         lw = max((width_m / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
         try:
-            x, y = row.geometry.xy
-            ax.plot(x, y, color=color, linewidth=lw, solid_capstyle='round', zorder=4)
+            plot_line_geometry(ax, row.geometry, color, lw, zorder=4, antialiased=snap_roads_45)
         except Exception as e:
             print(f"Error drawing a road: {e}")
 
@@ -467,14 +592,18 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
     ax.set_aspect('equal')
 
 def render_cell(output_path, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
+                meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False,
+                snap_roads_45=False):
     fig, ax = plt.subplots(figsize=(CELL_PX / RENDER_DPI, CELL_PX / RENDER_DPI), dpi=RENDER_DPI)
     fig.subplots_adjust(0, 0, 1, 1)
     draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale, cell_railways, render_trains)
+                  meters_per_pixel, road_width_scale, cell_railways, render_trains, snap_roads_45)
     for artist in ax.get_children():
         if hasattr(artist, 'set_antialiased'):
-            artist.set_antialiased(False)
+            if snap_roads_45 and isinstance(artist, Line2D):
+                artist.set_antialiased(True)
+            else:
+                artist.set_antialiased(False)
     plt.savefig(output_path, dpi=RENDER_DPI, pad_inches=0, bbox_inches='tight')
     plt.close(fig)
 
@@ -534,7 +663,7 @@ def count_complete_cells(output_dir, veg_output_dir, nb_cells):
     return complete
 
 def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label,
-                      resume=False, output_name=None, render_trains=False):
+                      resume=False, output_name=None, render_trains=False, snap_roads_45=False):
     try:
         output_base = get_output_dir(lat, lon, nb_cells, output_name)
         os.makedirs(output_base, exist_ok=True)
@@ -593,6 +722,9 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         total_bbox = box(xmin, ymin, xmax, ymax)
         gdf_features_utm = gdf_features_utm.clip(total_bbox)
         gdf_edges_utm = gdf_edges_utm.clip(total_bbox)
+        if snap_roads_45:
+            print("Snapping roads to nearest 45° bearings...")
+            gdf_edges_utm = snap_roads_gdf_to_45(gdf_edges_utm)
         del gdf_edges, gdf_features
         gc.collect()
 
@@ -660,7 +792,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                     render_cell(
                         map_cell_path, cell_xmin, cell_ymin, cell_xmax, cell_ymax,
                         cell_polys, cell_lines, cell_roads, meters_per_pixel, road_width_scale,
-                        cell_railways, render_trains,
+                        cell_railways, render_trains, snap_roads_45,
                     )
 
                 with Image.open(map_cell_path) as cell_img:
@@ -899,6 +1031,20 @@ for widget in (trains_frame, trains_label, trains_check):
     ))
     widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
 
+snap_roads_var = tk.BooleanVar(value=False)
+snap_roads_frame = tk.Frame(frame)
+snap_roads_frame.grid(row=8, column=0, columnspan=2, sticky='w')
+snap_roads_label = tk.Label(snap_roads_frame, text="Snap roads to 45° (experimental)")
+snap_roads_label.pack(side='left')
+snap_roads_check = tk.Checkbutton(snap_roads_frame, variable=snap_roads_var)
+snap_roads_check.pack(side='left')
+for widget in (snap_roads_frame, snap_roads_label, snap_roads_check):
+    widget.bind("<Enter>", lambda e: status_label.config(
+        text="Experimental: align roads to 0°/45°/90° bearings for PZ-style isometric building placement.",
+        fg="gray",
+    ))
+    widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
+
 def on_generate_maps():
     try:
         lat = float(lat_entry.get())
@@ -908,13 +1054,15 @@ def on_generate_maps():
         width_scale = float(width_entry.get())
         resume = resume_var.get()
         render_trains = trains_var.get()
+        snap_roads_45 = snap_roads_var.get()
         output_name = output_name_entry.get()
         if n < 1:
             raise ValueError("Number of cells must be ≥ 1")
         if margin < 0:
             raise ValueError("Margin must be ≥ 0")
         generate_map_grid(lat, lon, n, width_scale, margin, status_label,
-                          resume=resume, output_name=output_name, render_trains=render_trains)
+                          resume=resume, output_name=output_name, render_trains=render_trains,
+                          snap_roads_45=snap_roads_45)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
@@ -930,7 +1078,7 @@ def on_generate_vegetation():
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
 
-tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=8, column=0, columnspan=2, pady=5)
+tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=9, column=0, columnspan=2, pady=5)
 
 root.update_idletasks()
 root.minsize(PREVIEW_WIDTH + 40, root.winfo_height())
