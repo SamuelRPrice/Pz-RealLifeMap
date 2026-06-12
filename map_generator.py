@@ -2,6 +2,7 @@ import gc
 import io
 import math
 import os
+import re
 import shutil
 import threading
 import tkinter as tk
@@ -412,7 +413,20 @@ def cleanup_cache():
         shutil.rmtree(cache_dir)
         print(f"Cache directory '{cache_dir}' has been removed.")
 
-def get_output_dir(lat, lon, nb_cells):
+def sanitize_output_name(name):
+    name = name.strip()
+    if not name:
+        return None
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    name = name.strip('. ')
+    if not name:
+        raise ValueError("Output folder name is invalid")
+    return name
+
+def get_output_dir(lat, lon, nb_cells, output_name=None):
+    custom_name = sanitize_output_name(output_name or "")
+    if custom_name:
+        return os.path.join("output", custom_name)
     lat_str = f"{lat:.6f}".rstrip('0').rstrip('.')
     lon_str = f"{lon:.6f}".rstrip('0').rstrip('.')
     return os.path.join("output", f"{lat_str}_{lon_str}_{nb_cells}x{nb_cells}")
@@ -437,9 +451,10 @@ def count_complete_cells(output_dir, veg_output_dir, nb_cells):
                 complete += 1
     return complete
 
-def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label, resume=False):
+def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label,
+                      resume=False, output_name=None):
     try:
-        output_base = get_output_dir(lat, lon, nb_cells)
+        output_base = get_output_dir(lat, lon, nb_cells, output_name)
         os.makedirs(output_base, exist_ok=True)
         print(f"Output directory: {output_base}")
 
@@ -609,9 +624,9 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         status_label.config(text="Error during map generation.", fg="red")
         print(f"ERROR during map generation: {e}")
 
-def generate_vegetation_maps(lat, lon, nb_cells, status_label):
+def generate_vegetation_maps(lat, lon, nb_cells, status_label, output_name=None):
     try:
-        output_base = get_output_dir(lat, lon, nb_cells)
+        output_base = get_output_dir(lat, lon, nb_cells, output_name)
         input_dir = os.path.join(output_base, "map_cells")
         output_dir = os.path.join(output_base, "map_vegetation")
 
@@ -763,6 +778,8 @@ margin_entry = add_entry("Download margin (%):", 0.8, 3,
                          "Extra download buffer as % of map size (300m–2500m; large maps use the cap).")
 width_entry = add_entry("Road width scale:", 100, 4,
                         "Scale factor for road widths on the generated maps.")
+output_name_entry = add_entry("Output folder name:", "", 5,
+                              "Optional name under output/. Leave blank for lat_lon_NxN naming.")
 
 for entry in (lat_entry, lon_entry, cells_entry, margin_entry):
     entry.bind('<KeyRelease>', schedule_preview_update)
@@ -770,7 +787,7 @@ schedule_preview_update()
 
 resume_var = tk.BooleanVar(value=False)
 resume_frame = tk.Frame(frame)
-resume_frame.grid(row=5, column=0, columnspan=2, sticky='w')
+resume_frame.grid(row=6, column=0, columnspan=2, sticky='w')
 resume_label = tk.Label(resume_frame, text="Resume incomplete generation")
 resume_label.pack(side='left')
 resume_check = tk.Checkbutton(resume_frame, variable=resume_var)
@@ -790,11 +807,13 @@ def on_generate_maps():
         margin = float(margin_entry.get())
         width_scale = float(width_entry.get())
         resume = resume_var.get()
+        output_name = output_name_entry.get()
         if n < 1:
             raise ValueError("Number of cells must be ≥ 1")
         if margin < 0:
             raise ValueError("Margin must be ≥ 0")
-        generate_map_grid(lat, lon, n, width_scale, margin, status_label, resume=resume)
+        generate_map_grid(lat, lon, n, width_scale, margin, status_label,
+                          resume=resume, output_name=output_name)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
@@ -804,12 +823,13 @@ def on_generate_vegetation():
         lat = float(lat_entry.get())
         lon = float(lon_entry.get())
         n = int(cells_entry.get())
-        generate_vegetation_maps(lat, lon, n, status_label)
+        output_name = output_name_entry.get()
+        generate_vegetation_maps(lat, lon, n, status_label, output_name=output_name)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
 
-tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=6, column=0, columnspan=2, pady=5)
+tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=7, column=0, columnspan=2, pady=5)
 
 root.update_idletasks()
 root.minsize(PREVIEW_WIDTH + 40, root.winfo_height())
