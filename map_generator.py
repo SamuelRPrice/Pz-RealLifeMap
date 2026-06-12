@@ -1,13 +1,18 @@
 import gc
+import io
+import math
 import os
 import shutil
+import threading
 import tkinter as tk
 from tkinter.messagebox import showerror
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from PIL import Image
+from PIL import Image, ImageDraw, ImageTk
 import numpy as np
 import osmnx as ox
 from shapely.geometry import box
@@ -53,6 +58,11 @@ FEATURE_COLUMNS = ('natural', 'landuse', 'waterway')
 DRAWABLE_GEOM_TYPES = frozenset({
     'Polygon', 'MultiPolygon', 'LineString', 'MultiLineString',
 })
+PREVIEW_WIDTH = 400
+PREVIEW_HEIGHT = 260
+OSM_TILE_SIZE = 256
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_USER_AGENT = "Pz-RealLifeMap/1.0 (map generator preview)"
 
 
 
@@ -165,6 +175,97 @@ def classify_vegetation_color_vectorized(img_array):
 def compute_download_margin_m(total_zone_m, margin_factor):
     margin_m = total_zone_m * margin_factor
     return max(MIN_DOWNLOAD_MARGIN_M, min(margin_m, MAX_DOWNLOAD_MARGIN_M))
+
+def meters_to_degree_offsets(lat, half_size_m):
+    dlat = half_size_m / 111_320
+    cos_lat = math.cos(math.radians(lat))
+    dlon = half_size_m / (111_320 * max(abs(cos_lat), 1e-6))
+    return dlat, dlon
+
+def compute_render_bbox_deg(lat, lon, nb_cells):
+    half_m = (CELL_SIZE_M * nb_cells) / 2
+    dlat, dlon = meters_to_degree_offsets(lat, half_m)
+    return lat - dlat, lon - dlon, lat + dlat, lon + dlon
+
+def compute_download_bbox_deg(lat, lon, nb_cells, margin_factor):
+    total_zone_m = CELL_SIZE_M * nb_cells
+    margin_m = compute_download_margin_m(total_zone_m, margin_factor)
+    half_m = total_zone_m / 2 + margin_m
+    dlat, dlon = meters_to_degree_offsets(lat, half_m)
+    return lat - dlat, lon - dlon, lat + dlat, lon + dlon
+
+def lat_lon_to_tile_xy(lat, lon, zoom):
+    lat_rad = math.radians(lat)
+    n = 2 ** zoom
+    x = (lon + 180) / 360 * n
+    y = (1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * n
+    return x, y
+
+def latlon_to_world_px(lat, lon, zoom):
+    tile_x, tile_y = lat_lon_to_tile_xy(lat, lon, zoom)
+    return tile_x * OSM_TILE_SIZE, tile_y * OSM_TILE_SIZE
+
+def bbox_pixel_size(south, west, north, east, zoom):
+    x_w, y_n = lat_lon_to_tile_xy(north, west, zoom)
+    x_e, y_s = lat_lon_to_tile_xy(south, east, zoom)
+    return abs(x_e - x_w) * OSM_TILE_SIZE, abs(y_s - y_n) * OSM_TILE_SIZE
+
+def choose_preview_zoom(south, west, north, east):
+    for zoom in range(17, 2, -1):
+        width_px, height_px = bbox_pixel_size(south, west, north, east, zoom)
+        if width_px <= PREVIEW_WIDTH * 0.9 and height_px <= PREVIEW_HEIGHT * 0.9:
+            return zoom
+    return 3
+
+def fetch_osm_tile(zoom, tile_x, tile_y):
+    tile_count = 2 ** zoom
+    tile_x = int(tile_x) % tile_count
+    if tile_x < 0:
+        tile_x += tile_count
+    tile_y = max(0, min(int(tile_y), tile_count - 1))
+    url = OSM_TILE_URL.format(z=zoom, x=tile_x, y=tile_y)
+    request = Request(url, headers={'User-Agent': OSM_USER_AGENT})
+    with urlopen(request, timeout=10) as response:
+        return Image.open(io.BytesIO(response.read())).convert('RGB')
+
+def bbox_to_preview_rect(south, west, north, east, zoom, view_left, view_top):
+    x1, y1 = latlon_to_world_px(north, west, zoom)
+    x2, y2 = latlon_to_world_px(south, east, zoom)
+    return (
+        x1 - view_left, y1 - view_top,
+        x2 - view_left, y2 - view_top,
+    )
+
+def build_osm_preview(lat, lon, nb_cells, margin_factor):
+    render_bbox = compute_render_bbox_deg(lat, lon, nb_cells)
+    download_bbox = compute_download_bbox_deg(lat, lon, nb_cells, margin_factor)
+    south, west, north, east = download_bbox
+    zoom = choose_preview_zoom(south, west, north, east)
+
+    center_x, center_y = latlon_to_world_px(lat, lon, zoom)
+    view_left = center_x - PREVIEW_WIDTH / 2
+    view_top = center_y - PREVIEW_HEIGHT / 2
+
+    tile_x_min = int(math.floor(view_left / OSM_TILE_SIZE))
+    tile_y_min = int(math.floor(view_top / OSM_TILE_SIZE))
+    tile_x_max = int(math.floor((view_left + PREVIEW_WIDTH - 1) / OSM_TILE_SIZE))
+    tile_y_max = int(math.floor((view_top + PREVIEW_HEIGHT - 1) / OSM_TILE_SIZE))
+
+    composite = Image.new('RGB', (PREVIEW_WIDTH, PREVIEW_HEIGHT), (232, 232, 232))
+    for tile_x in range(tile_x_min, tile_x_max + 1):
+        for tile_y in range(tile_y_min, tile_y_max + 1):
+            tile_img = fetch_osm_tile(zoom, tile_x, tile_y)
+            paste_x = int(tile_x * OSM_TILE_SIZE - view_left)
+            paste_y = int(tile_y * OSM_TILE_SIZE - view_top)
+            composite.paste(tile_img, (paste_x, paste_y))
+
+    draw = ImageDraw.Draw(composite)
+    download_rect = bbox_to_preview_rect(*download_bbox, zoom, view_left, view_top)
+    render_rect = bbox_to_preview_rect(*render_bbox, zoom, view_left, view_top)
+    draw.rectangle(download_rect, outline=(0, 120, 255), width=2)
+    draw.rectangle(render_rect, outline=(220, 40, 40), width=3)
+
+    return composite
 
 def slim_feature_gdf(gdf):
     if gdf.empty:
@@ -556,18 +657,91 @@ def generate_vegetation_maps(lat, lon, nb_cells, status_label):
 root = tk.Tk()
 root.title("OSM + Vegetation Map Generator")
 
+preview_frame = tk.Frame(root, padx=10, pady=10)
+preview_frame.pack(side='top', fill='x')
+tk.Label(preview_frame, text="Generation area preview").pack(anchor='w')
+preview_label = tk.Label(
+    preview_frame, bg='#e8e8e8', text="Loading preview...", fg='gray',
+)
+preview_label.pack(pady=2)
+preview_info = tk.Label(
+    preview_frame, text="", fg='gray', font=('TkDefaultFont', 8), justify='left',
+)
+preview_info.pack(anchor='w', pady=2)
+tk.Label(
+    preview_frame, text="© OpenStreetMap contributors", fg='gray',
+    font=('TkDefaultFont', 7),
+).pack(anchor='e')
+
 frame = tk.Frame(root, padx=10, pady=10)
-frame.pack()
+frame.pack(side='top')
 
 STATUS_WRAP = 380
 status_frame = tk.Frame(root, height=64)
-status_frame.pack(fill='x', padx=10, pady=5)
+status_frame.pack(side='bottom', fill='x', padx=10, pady=5)
 status_frame.pack_propagate(False)
 status_label = tk.Label(
     status_frame, text="", fg="green", wraplength=STATUS_WRAP,
     justify='left', anchor='nw',
 )
 status_label.pack(fill='both', expand=True, anchor='w')
+
+preview_job = None
+preview_request_id = 0
+
+def apply_preview_image(photo, info_text):
+    preview_label.config(image=photo, text='')
+    preview_label.image = photo
+    preview_info.config(text=info_text)
+
+def show_preview_error(message):
+    preview_label.config(image='', text=message)
+    preview_label.image = None
+    preview_info.config(text='')
+
+def update_preview():
+    global preview_request_id
+    preview_request_id += 1
+    request_id = preview_request_id
+    try:
+        lat = float(lat_entry.get())
+        lon = float(lon_entry.get())
+        nb_cells = int(cells_entry.get())
+        margin_factor = float(margin_entry.get())
+        if nb_cells < 1:
+            raise ValueError("grid size")
+    except ValueError:
+        show_preview_error("Enter valid latitude, longitude, and grid size")
+        return
+
+    side_km = (CELL_SIZE_M * nb_cells) / 1000
+    info_text = (
+        f"{nb_cells}×{nb_cells} cells · {side_km:.2f} km/side  |  "
+        f"Red = generated map  ·  Blue = OSM download buffer"
+    )
+
+    def worker():
+        try:
+            image = build_osm_preview(lat, lon, nb_cells, margin_factor)
+            if request_id == preview_request_id:
+                def apply():
+                    photo = ImageTk.PhotoImage(image)
+                    apply_preview_image(photo, info_text)
+                root.after(0, apply)
+        except (URLError, TimeoutError, ValueError) as exc:
+            if request_id == preview_request_id:
+                root.after(0, lambda: show_preview_error(f"Preview unavailable: {exc}"))
+        except Exception as exc:
+            if request_id == preview_request_id:
+                root.after(0, lambda: show_preview_error(f"Preview unavailable: {exc}"))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def schedule_preview_update(event=None):
+    global preview_job
+    if preview_job is not None:
+        root.after_cancel(preview_job)
+    preview_job = root.after(400, update_preview)
 
 def add_entry(label_text, default_value, row, tooltip=None):
     tk.Label(frame, text=label_text).grid(row=row, column=0, sticky='e')
@@ -589,6 +763,10 @@ margin_entry = add_entry("Download margin (%):", 0.8, 3,
                          "Extra download buffer as % of map size (300m–2500m; large maps use the cap).")
 width_entry = add_entry("Road width scale:", 100, 4,
                         "Scale factor for road widths on the generated maps.")
+
+for entry in (lat_entry, lon_entry, cells_entry, margin_entry):
+    entry.bind('<KeyRelease>', schedule_preview_update)
+schedule_preview_update()
 
 resume_var = tk.BooleanVar(value=False)
 resume_frame = tk.Frame(frame)
@@ -634,6 +812,6 @@ def on_generate_vegetation():
 tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=6, column=0, columnspan=2, pady=5)
 
 root.update_idletasks()
-root.minsize(root.winfo_width(), root.winfo_height())
+root.minsize(PREVIEW_WIDTH + 40, root.winfo_height())
 
 root.mainloop()
