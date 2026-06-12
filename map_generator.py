@@ -14,9 +14,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from PIL import Image, ImageDraw, ImageTk
+import geopandas as gpd
 import numpy as np
 import osmnx as ox
-from shapely.geometry import box
+from shapely.geometry import Point, box
 
 
 
@@ -185,17 +186,30 @@ def meters_to_degree_offsets(lat, half_size_m):
     dlon = half_size_m / (111_320 * max(abs(cos_lat), 1e-6))
     return dlat, dlon
 
+def get_utm_center(lat, lon, utm_crs=None):
+    center_gdf = gpd.GeoDataFrame(geometry=[Point(lon, lat)], crs='EPSG:4326')
+    if utm_crs is None:
+        utm_crs = center_gdf.estimate_utm_crs()
+    center_utm = center_gdf.to_crs(utm_crs)
+    return center_utm.geometry.x.iloc[0], center_utm.geometry.y.iloc[0], utm_crs
+
+def utm_square_bbox_wgs84(lat, lon, half_size_m, utm_crs=None):
+    cx, cy, utm_crs = get_utm_center(lat, lon, utm_crs)
+    sw = gpd.GeoDataFrame(geometry=[Point(cx - half_size_m, cy - half_size_m)], crs=utm_crs)
+    ne = gpd.GeoDataFrame(geometry=[Point(cx + half_size_m, cy + half_size_m)], crs=utm_crs)
+    sw_wgs = sw.to_crs('EPSG:4326').geometry.iloc[0]
+    ne_wgs = ne.to_crs('EPSG:4326').geometry.iloc[0]
+    return sw_wgs.y, sw_wgs.x, ne_wgs.y, ne_wgs.x
+
 def compute_render_bbox_deg(lat, lon, nb_cells):
     half_m = (CELL_SIZE_M * nb_cells) / 2
-    dlat, dlon = meters_to_degree_offsets(lat, half_m)
-    return lat - dlat, lon - dlon, lat + dlat, lon + dlon
+    return utm_square_bbox_wgs84(lat, lon, half_m)
 
 def compute_download_bbox_deg(lat, lon, nb_cells, margin_factor):
     total_zone_m = CELL_SIZE_M * nb_cells
     margin_m = compute_download_margin_m(total_zone_m, margin_factor)
     half_m = total_zone_m / 2 + margin_m
-    dlat, dlon = meters_to_degree_offsets(lat, half_m)
-    return lat - dlat, lon - dlon, lat + dlat, lon + dlon
+    return utm_square_bbox_wgs84(lat, lon, half_m)
 
 def lat_lon_to_tile_xy(lat, lon, zoom):
     lat_rad = math.radians(lat)
@@ -267,6 +281,14 @@ def build_osm_preview(lat, lon, nb_cells, margin_factor):
     render_rect = bbox_to_preview_rect(*render_bbox, zoom, view_left, view_top)
     draw.rectangle(download_rect, outline=(0, 120, 255), width=2)
     draw.rectangle(render_rect, outline=(220, 40, 40), width=3)
+
+    center_x, center_y = latlon_to_world_px(lat, lon, zoom)
+    mark_x = int(center_x - view_left)
+    mark_y = int(center_y - view_top)
+    cross = 7
+    draw.line([(mark_x - cross, mark_y), (mark_x + cross, mark_y)], fill=(255, 255, 255), width=2)
+    draw.line([(mark_x, mark_y - cross), (mark_x, mark_y + cross)], fill=(255, 255, 255), width=2)
+    draw.ellipse([mark_x - 3, mark_y - 3, mark_x + 3, mark_y + 3], outline=(255, 255, 255), width=2)
 
     return composite
 
@@ -539,9 +561,8 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         utm_crs = gdf_edges_utm.crs
         gdf_features_utm = gdf_features.to_crs(utm_crs)
 
-        center_x = gdf_edges_utm.geometry.centroid.x.mean()
-        center_y = gdf_edges_utm.geometry.centroid.y.mean()
-        print(f"Map center: ({center_x:.0f}, {center_y:.0f})")
+        center_x, center_y, _ = get_utm_center(lat, lon, utm_crs)
+        print(f"Map center (input lat/lon): ({center_x:.0f}, {center_y:.0f})")
 
         xmin = center_x - total_zone_m / 2
         xmax = center_x + total_zone_m / 2
@@ -777,7 +798,7 @@ def update_preview():
     side_km = (CELL_SIZE_M * nb_cells) / 1000
     info_text = (
         f"{nb_cells}×{nb_cells} cells · {side_km:.2f} km/side  |  "
-        f"Red = generated map  ·  Blue = OSM download buffer"
+        f"Red = generated map  ·  Blue = OSM download buffer  ·  ⊕ = center lat/lon"
     )
 
     def worker():
