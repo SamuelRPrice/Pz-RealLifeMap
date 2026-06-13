@@ -6,6 +6,7 @@ cache/
 
 # Local user settings
 last_settings.json
+worlded_export_settings.json
 
 # Cringe MacOS file
 .DS_Store
