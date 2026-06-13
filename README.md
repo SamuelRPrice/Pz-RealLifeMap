@@ -63,7 +63,13 @@ All generated files are saved under `output/`, in a subfolder named from the coo
 
 ### Complete Maps (Full Resolution)
 * `complete_map.png` — Full resolution simplified map of the entire downloaded area
-* `complete_vegetation_map.png` — Full resolution vegetation map of the entire downloaded area
+* `complete_map_veg.png` — Full resolution vegetation map of the entire downloaded area
+* `complete_roads.png` — Vehicle roads only (excludes footways, paths, pedestrian ways, steps, etc.)
+* `complete_roads_with_sidewalk_both.png` — Roads tagged `sidewalk=both` or `sidewalk=yes`
+* `complete_roads_with_sidewalk_left.png` — Roads tagged `sidewalk=left`, `both`, or `yes`
+* `complete_roads_with_sidewalk_right.png` — Roads tagged `sidewalk=right`, `both`, or `yes`
+* `complete_footpaths.png` — Pedestrian walkways only (`footway`, `path`, `pedestrian`, `steps`, etc.)
+* `complete_canals.png` — Canals from OSM `waterway=canal` features
 
 These complete maps are useful for:
 - Verifying that all data was correctly downloaded and rendered
@@ -71,8 +77,9 @@ These complete maps are useful for:
 - Debugging any issues with the generation process
 
 ### Map Tiles (Cell Grid)
-* `map_cells/` — Contains simplified map tiles in a grid format (e.g., `0,0.png`, `0,1.png`, etc.)
-* `map_vegetation/` — Contains corresponding vegetation map tiles
+* `map_cells/` — Contains simplified map tiles in a grid format (e.g., `0,0.png`, `0,1.png`, etc.) plus tool layers per cell:
+  * `0,0_roads.png`, `0,0_roads_with_sidewalk_both.png`, `0,0_roads_with_sidewalk_left.png`, `0,0_roads_with_sidewalk_right.png`, `0,0_footpaths.png`, `0,0_canals.png`
+* `map_vegetation/` — Contains corresponding vegetation map tiles (`0,0_veg.png`, etc.)
 
 Each cell is 300x300 pixels and represents a 300x300 meter area in the real world.
 

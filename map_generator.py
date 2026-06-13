@@ -1,5 +1,6 @@
 import gc
 import io
+import json
 import math
 import os
 import re
@@ -12,7 +13,6 @@ from urllib.request import Request, urlopen
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from PIL import Image, ImageDraw, ImageTk
 import geopandas as gpd
@@ -63,9 +63,20 @@ UNDERGROUND_TUNNEL_VALUES = frozenset({'yes', 'true', 'culvert', 'flooded'})
 UNDERGROUND_WATERWAY_TYPES = frozenset({'culvert', 'pressurised', 'pressurized', 'pipe'})
 RAILWAY_WIDTH_M = 4
 RAILWAY_EXCLUDE = frozenset({'abandoned', 'disused', 'razed', 'proposed', 'construction'})
-OCTOLINEAR_SIMPLIFY_M = 20
-OCTOLINEAR_JUNCTION_SNAP_M = 12
-OCTOLINEAR_MIN_SEGMENT_M = 3
+PEDESTRIAN_HIGHWAY_TYPES = frozenset({
+    'footway', 'path', 'pedestrian', 'steps', 'corridor', 'crossing',
+    'elevator', 'escape', 'platform',
+})
+OSMNX_EXTRA_WAY_TAGS = ('sidewalk', 'sidewalk:left', 'sidewalk:right', 'sidewalk:both', 'surface')
+SIDEWALK_YES_VALUES = frozenset({'yes', 'true', '1', 'both'})
+LAYER_SUFFIXES = (
+    'roads',
+    'roads_with_sidewalk_both',
+    'roads_with_sidewalk_left',
+    'roads_with_sidewalk_right',
+    'footpaths',
+    'canals',
+)
 DRAWABLE_GEOM_TYPES = frozenset({
     'Polygon', 'MultiPolygon', 'LineString', 'MultiLineString',
 })
@@ -75,10 +86,55 @@ OSM_TILE_SIZE = 256
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OSM_USER_AGENT = "Pz-RealLifeMap/1.0 (map generator preview)"
 
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_settings.json')
+DEFAULT_SETTINGS = {
+    'latitude': '47.80328791813283',
+    'longitude': '-3.7209986709586205',
+    'nb_cells': '2',
+    'margin_factor': '0.8',
+    'road_width_scale': '100',
+    'output_name': '',
+    'resume': False,
+    'render_trains': False,
+}
+
 
 
 
 # ========== UTILS ==========
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, encoding='utf-8') as settings_file:
+            saved = json.load(settings_file)
+        if isinstance(saved, dict):
+            for key in DEFAULT_SETTINGS:
+                if key in saved:
+                    settings[key] = saved[key]
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return settings
+
+def save_settings(settings):
+    payload = {key: settings.get(key, DEFAULT_SETTINGS[key]) for key in DEFAULT_SETTINGS}
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as settings_file:
+            json.dump(payload, settings_file, indent=2)
+    except OSError as exc:
+        print(f"Could not save settings: {exc}")
+
+def collect_gui_settings():
+    return {
+        'latitude': lat_entry.get(),
+        'longitude': lon_entry.get(),
+        'nb_cells': cells_entry.get(),
+        'margin_factor': margin_entry.get(),
+        'road_width_scale': width_entry.get(),
+        'output_name': output_name_entry.get(),
+        'resume': resume_var.get(),
+        'render_trains': trains_var.get(),
+    }
+
 def get_natural_color(natural_value):
     if natural_value is None:
         return None
@@ -109,18 +165,30 @@ def get_landuse_color(landuse_value):
 def get_road_color(highway, surface=None):
     if isinstance(highway, list): highway = highway[0]
     if isinstance(surface, list): surface = surface[0]
-    if highway in ['motorway', 'primary', 'trunk']:
+    highway_tag = str(highway).lower() if highway else ''
+    if highway_tag in ['motorway', 'primary', 'trunk']:
         return PALETTE['dark_asphalt']
-    elif highway in ['secondary', 'tertiary', 'residential', 'service', 'unclassified']:
+    elif highway_tag in ['secondary', 'tertiary', 'residential', 'service', 'unclassified']:
         return PALETTE['medium_asphalt']
-    elif highway in ['path', 'track', 'bridleway', 'cycleway', 'footway']:
-        if surface == 'sand':
+    elif highway_tag in PEDESTRIAN_HIGHWAY_TYPES:
+        return get_footpath_color(surface)
+    elif highway_tag in ['track', 'bridleway', 'cycleway']:
+        if normalize_osm_tag(surface) == 'sand':
             return PALETTE['sand']
-        elif surface in ['gravel', 'dirt', 'earth']:
+        elif normalize_osm_tag(surface) in {'gravel', 'dirt', 'earth'}:
             return PALETTE['gravel_dirt']
-        else:
-            return PALETTE['dirt']
+        return PALETTE['dirt']
     return PALETTE['medium_asphalt']
+
+def get_footpath_color(surface=None):
+    surface_tag = normalize_osm_tag(surface)
+    if surface_tag == 'sand':
+        return PALETTE['sand']
+    if surface_tag == 'gravel':
+        return PALETTE['gravel_dirt']
+    if surface_tag in {'dirt', 'earth'}:
+        return PALETTE['dirt']
+    return PALETTE['light_asphalt']
 
 def get_road_width_m(highway):
     if isinstance(highway, list): highway = highway[0]
@@ -162,6 +230,84 @@ def get_road_priority(highway):
     }
     
     return priority_order.get(highway, 5)  # valeur par défaut pour les types inconnus
+
+def normalize_osm_tag(value):
+    if value is None:
+        return ''
+    if isinstance(value, float) and np.isnan(value):
+        return ''
+    if isinstance(value, list):
+        return str(value[0]).lower() if value else ''
+    return str(value).lower()
+
+def normalize_highway(highway):
+    return normalize_osm_tag(highway)
+
+def is_vehicle_road(highway):
+    tag = normalize_highway(highway)
+    return bool(tag) and tag not in PEDESTRIAN_HIGHWAY_TYPES
+
+def is_pedestrian_way(highway):
+    return normalize_highway(highway) in PEDESTRIAN_HIGHWAY_TYPES
+
+def sidewalk_tag_implies_both(tag):
+    return tag in {'both', 'yes', 'separate'}
+
+def sidewalk_tag_implies_left(tag):
+    return tag in {'left', 'both', 'yes'}
+
+def sidewalk_tag_implies_right(tag):
+    return tag in {'right', 'both', 'yes'}
+
+def get_road_sidewalk_info(row):
+    return (
+        normalize_osm_tag(row.get('sidewalk')),
+        normalize_osm_tag(row.get('sidewalk:left')),
+        normalize_osm_tag(row.get('sidewalk:right')),
+        normalize_osm_tag(row.get('sidewalk:both')),
+    )
+
+def road_matches_sidewalk_side(row, sidewalk_side):
+    main, left, right, both = get_road_sidewalk_info(row)
+    if main in {'no', 'none'}:
+        return False
+    if sidewalk_side == 'both':
+        if sidewalk_tag_implies_both(main):
+            return True
+        if both in SIDEWALK_YES_VALUES:
+            return True
+        return left in SIDEWALK_YES_VALUES and right in SIDEWALK_YES_VALUES
+    if sidewalk_side == 'left':
+        if main == 'right':
+            return False
+        if sidewalk_tag_implies_left(main):
+            return True
+        return left in SIDEWALK_YES_VALUES
+    if sidewalk_side == 'right':
+        if main == 'left':
+            return False
+        if sidewalk_tag_implies_right(main):
+            return True
+        return right in SIDEWALK_YES_VALUES
+    return False
+
+def filter_roads_for_sidewalk_layer(cell_roads, sidewalk_side):
+    return [
+        item for item in cell_roads
+        if road_matches_sidewalk_side(item[2], sidewalk_side)
+    ]
+
+def count_sidewalk_tagged_vehicle_roads(gdf_edges_utm):
+    counts = {'both': 0, 'left': 0, 'right': 0}
+    if gdf_edges_utm.empty:
+        return counts
+    for _, row in gdf_edges_utm.iterrows():
+        if not is_vehicle_road(row.get('highway')):
+            continue
+        for side in counts:
+            if road_matches_sidewalk_side(row, side):
+                counts[side] += 1
+    return counts
 
 # ========== VEGETATION MAP ==========
 def classify_vegetation_color_vectorized(img_array):
@@ -305,6 +451,13 @@ def get_feature_tags(render_trains=False):
         tags['railway'] = True
     return tags
 
+def configure_osmnx_way_tags():
+    way_tags = list(ox.settings.useful_tags_way)
+    for tag in OSMNX_EXTRA_WAY_TAGS:
+        if tag not in way_tags:
+            way_tags.append(tag)
+    ox.settings.useful_tags_way = way_tags
+
 def underground_mask(gdf):
     if gdf.empty:
         return np.zeros(0, dtype=bool)
@@ -336,9 +489,6 @@ def filter_gdf_by_box(gdf, bbox):
     indices = gdf.sindex.query(bbox, predicate='intersects')
     return gdf.iloc[list(indices)]
 
-def snap_angle_to_45(angle):
-    return round(angle / (math.pi / 4)) * (math.pi / 4)
-
 def iter_linestrings(geometry):
     if geometry is None or geometry.is_empty:
         return
@@ -347,114 +497,7 @@ def iter_linestrings(geometry):
     elif geometry.geom_type == 'MultiLineString':
         yield from geometry.geoms
 
-def _junction_bucket(point, tolerance_m):
-    return (round(point[0] / tolerance_m), round(point[1] / tolerance_m))
-
-def build_junction_map(geometries, tolerance_m=OCTOLINEAR_JUNCTION_SNAP_M):
-    buckets = {}
-    for geometry in geometries:
-        for line in iter_linestrings(geometry):
-            for point in (line.coords[0], line.coords[-1]):
-                key = _junction_bucket(point, tolerance_m)
-                buckets.setdefault(key, []).append(point)
-    junction_map = {}
-    for key, points in buckets.items():
-        junction_map[key] = (
-            sum(p[0] for p in points) / len(points),
-            sum(p[1] for p in points) / len(points),
-        )
-    return junction_map
-
-def _snap_point_to_junction(point, junction_map, tolerance_m=OCTOLINEAR_JUNCTION_SNAP_M):
-    return junction_map.get(_junction_bucket(point, tolerance_m), point)
-
-def _segment_angle(p0, p1):
-    return math.atan2(p1[1] - p0[1], p1[0] - p0[0])
-
-def _angles_match(a, b, tolerance_rad=0.08):
-    delta = abs((a - b + math.pi) % (2 * math.pi) - math.pi)
-    return delta < tolerance_rad
-
-def merge_collinear_coords(coords):
-    if len(coords) < 3:
-        return coords
-    merged = [coords[0]]
-    for i in range(1, len(coords) - 1):
-        prev_angle = _segment_angle(merged[-1], coords[i])
-        next_angle = _segment_angle(coords[i], coords[i + 1])
-        if _angles_match(prev_angle, next_angle):
-            continue
-        merged.append(coords[i])
-    merged.append(coords[-1])
-    return merged
-
-def snap_coords_to_45(coords):
-    if len(coords) < 2:
-        return coords
-    snapped = [coords[0]]
-    for i in range(len(coords) - 1):
-        x0, y0 = snapped[-1]
-        x1, y1 = coords[i + 1]
-        dx, dy = x1 - x0, y1 - y0
-        length = math.hypot(dx, dy)
-        if length < OCTOLINEAR_MIN_SEGMENT_M:
-            continue
-        angle = snap_angle_to_45(math.atan2(dy, dx))
-        snapped.append((x0 + length * math.cos(angle), y0 + length * math.sin(angle)))
-    return merge_collinear_coords(snapped)
-
-def snap_linestring_to_45(line, junction_map, simplify_tolerance_m=OCTOLINEAR_SIMPLIFY_M):
-    if line is None or line.is_empty:
-        return line
-    simplified = line.simplify(simplify_tolerance_m, preserve_topology=True)
-    coords = list(simplified.coords)
-    if len(coords) < 2:
-        return simplified
-    start = _snap_point_to_junction(coords[0], junction_map)
-    end = _snap_point_to_junction(coords[-1], junction_map)
-    if len(coords) == 2:
-        snapped = snap_coords_to_45([start, end])
-    else:
-        interior = coords[1:-1]
-        snapped = snap_coords_to_45([start, *interior, end])
-    if len(snapped) < 2:
-        return LineString([start, end])
-    snapped[0] = start
-    snapped[-1] = end
-    snapped = merge_collinear_coords(snapped)
-    if len(snapped) < 2:
-        return LineString([start, end])
-    return LineString(snapped)
-
-def snap_geometry_to_45(geometry, junction_map, simplify_tolerance_m=OCTOLINEAR_SIMPLIFY_M):
-    if geometry is None or geometry.is_empty:
-        return geometry
-    if geometry.geom_type == 'LineString':
-        return snap_linestring_to_45(geometry, junction_map, simplify_tolerance_m)
-    if geometry.geom_type == 'MultiLineString':
-        parts = [
-            snap_linestring_to_45(part, junction_map, simplify_tolerance_m)
-            for part in geometry.geoms
-        ]
-        parts = [part for part in parts if not part.is_empty and len(part.coords) >= 2]
-        if not parts:
-            return geometry
-        return MultiLineString(parts)
-    return geometry
-
-def snap_roads_gdf_to_45(gdf_edges_utm):
-    simplified_geoms = [
-        geom.simplify(OCTOLINEAR_SIMPLIFY_M, preserve_topology=True)
-        for geom in gdf_edges_utm.geometry
-    ]
-    junction_map = build_junction_map(simplified_geoms)
-    snapped = gdf_edges_utm.copy()
-    snapped.geometry = [
-        snap_geometry_to_45(geom, junction_map) for geom in gdf_edges_utm.geometry
-    ]
-    return snapped
-
-def get_roads_for_cell(gdf_edges_utm, bbox):
+def get_roads_for_cell(gdf_edges_utm, bbox, vehicle_roads_only=False, pedestrian_only=False):
     if gdf_edges_utm.empty:
         return []
     indices = gdf_edges_utm.sindex.query(bbox, predicate='intersects')
@@ -463,8 +506,14 @@ def get_roads_for_cell(gdf_edges_utm, bbox):
     roads = []
     for idx, row in gdf_edges_utm.iloc[list(indices)].iterrows():
         highway = row.get('highway')
-        if highway:
-            roads.append((get_road_priority(highway), idx, row))
+        if not highway:
+            continue
+        if pedestrian_only:
+            if not is_pedestrian_way(highway):
+                continue
+        elif vehicle_roads_only and not is_vehicle_road(highway):
+            continue
+        roads.append((get_road_priority(highway), idx, row))
     roads.sort(key=lambda x: x[0])
     return roads
 
@@ -508,6 +557,78 @@ def prepare_railway_lines(gdf_features_utm):
         return railways
     return railways[['geometry', 'railway']]
 
+def prepare_canal_layers(gdf_features_utm):
+    polys = gdf_features_utm[gdf_features_utm.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
+    lines = gdf_features_utm[gdf_features_utm.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
+    canal_polys = polys.iloc[0:0].copy()
+    canal_lines = lines.iloc[0:0].copy()
+    if not polys.empty and 'waterway' in polys.columns:
+        canal_polys = polys[polys['waterway'].astype(str).str.lower().eq('canal')].copy()
+        canal_polys = canal_polys.loc[~underground_mask(canal_polys)]
+    if not lines.empty and 'waterway' in lines.columns:
+        canal_lines = lines[lines['waterway'].astype(str).str.lower().eq('canal')].copy()
+        canal_lines = canal_lines.loc[~underground_mask(canal_lines)]
+    return canal_polys, canal_lines
+
+def draw_cell_roads(ax, cell_roads, meters_per_pixel, road_width_scale, zorder=4):
+    for _, _, row in cell_roads:
+        highway = row.get('highway')
+        surface = row.get('surface')
+        color = get_road_color(highway, surface)
+        width_m = get_road_width_m(highway)
+        lw = max((width_m / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
+        try:
+            plot_line_geometry(ax, row.geometry, color, lw, zorder=zorder, antialiased=False)
+        except Exception as e:
+            print(f"Error drawing a road: {e}")
+
+def draw_canals(ax, cell_canal_polys, cell_canal_lines):
+    if not cell_canal_polys.empty:
+        cell_canal_polys.plot(ax=ax, color=PALETTE['water'], linewidth=0, zorder=2)
+    for _, row in cell_canal_lines.iterrows():
+        try:
+            plot_line_geometry(ax, row.geometry, PALETTE['water'], 3, zorder=2, antialiased=False)
+        except Exception as e:
+            print(f"Error drawing a canal: {e}")
+
+def draw_layer_cell(ax, xmin, ymin, xmax, ymax, layer_name, cell_roads, meters_per_pixel,
+                    road_width_scale, cell_canal_polys=None, cell_canal_lines=None,
+                    cell_footpaths=None):
+    ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
+                           facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
+    if layer_name == 'roads':
+        draw_cell_roads(ax, cell_roads, meters_per_pixel, road_width_scale)
+    elif layer_name == 'canals':
+        draw_canals(ax, cell_canal_polys, cell_canal_lines)
+    elif layer_name == 'roads_with_sidewalk_both':
+        draw_cell_roads(ax, filter_roads_for_sidewalk_layer(cell_roads, 'both'),
+                        meters_per_pixel, road_width_scale)
+    elif layer_name == 'roads_with_sidewalk_left':
+        draw_cell_roads(ax, filter_roads_for_sidewalk_layer(cell_roads, 'left'),
+                        meters_per_pixel, road_width_scale)
+    elif layer_name == 'roads_with_sidewalk_right':
+        draw_cell_roads(ax, filter_roads_for_sidewalk_layer(cell_roads, 'right'),
+                        meters_per_pixel, road_width_scale)
+    elif layer_name == 'footpaths':
+        draw_cell_roads(ax, cell_footpaths or [], meters_per_pixel, road_width_scale)
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_axis_off()
+    ax.set_aspect('equal')
+
+def render_layer_cell(output_path, xmin, ymin, xmax, ymax, layer_name, cell_roads, meters_per_pixel,
+                      road_width_scale, cell_canal_polys=None, cell_canal_lines=None,
+                      cell_footpaths=None):
+    fig, ax = plt.subplots(figsize=(CELL_PX / RENDER_DPI, CELL_PX / RENDER_DPI), dpi=RENDER_DPI)
+    fig.subplots_adjust(0, 0, 1, 1)
+    draw_layer_cell(ax, xmin, ymin, xmax, ymax, layer_name, cell_roads, meters_per_pixel,
+                    road_width_scale, cell_canal_polys, cell_canal_lines, cell_footpaths)
+    for artist in ax.get_children():
+        if hasattr(artist, 'set_antialiased'):
+            artist.set_antialiased(False)
+    plt.savefig(output_path, dpi=RENDER_DPI, pad_inches=0, bbox_inches='tight')
+    plt.close(fig)
+
 def plot_line_geometry(ax, geometry, color, linewidth, zorder, antialiased=False):
     if geometry.geom_type == 'LineString':
         parts = [geometry]
@@ -523,8 +644,7 @@ def plot_line_geometry(ax, geometry, color, linewidth, zorder, antialiased=False
         )
 
 def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False,
-                  snap_roads_45=False):
+                  meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
     ax.add_patch(Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
                            facecolor=PALETTE['light_grass'], edgecolor='none', zorder=0))
 
@@ -575,16 +695,7 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
             except Exception as e:
                 print(f"Error drawing a railway line: {e}")
 
-    for _, _, row in cell_roads:
-        highway = row.get('highway')
-        surface = row.get('surface')
-        color = get_road_color(highway, surface)
-        width_m = get_road_width_m(highway)
-        lw = max((width_m / meters_per_pixel) * 0.01 * road_width_scale, 0.1)
-        try:
-            plot_line_geometry(ax, row.geometry, color, lw, zorder=4, antialiased=snap_roads_45)
-        except Exception as e:
-            print(f"Error drawing a road: {e}")
+    draw_cell_roads(ax, cell_roads, meters_per_pixel, road_width_scale)
 
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
@@ -592,18 +703,14 @@ def draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads
     ax.set_aspect('equal')
 
 def render_cell(output_path, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False,
-                snap_roads_45=False):
+                meters_per_pixel, road_width_scale, cell_railways=None, render_trains=False):
     fig, ax = plt.subplots(figsize=(CELL_PX / RENDER_DPI, CELL_PX / RENDER_DPI), dpi=RENDER_DPI)
     fig.subplots_adjust(0, 0, 1, 1)
     draw_map_cell(ax, xmin, ymin, xmax, ymax, cell_polys, cell_lines, cell_roads,
-                  meters_per_pixel, road_width_scale, cell_railways, render_trains, snap_roads_45)
+                  meters_per_pixel, road_width_scale, cell_railways, render_trains)
     for artist in ax.get_children():
         if hasattr(artist, 'set_antialiased'):
-            if snap_roads_45 and isinstance(artist, Line2D):
-                artist.set_antialiased(True)
-            else:
-                artist.set_antialiased(False)
+            artist.set_antialiased(False)
     plt.savefig(output_path, dpi=RENDER_DPI, pad_inches=0, bbox_inches='tight')
     plt.close(fig)
 
@@ -642,15 +749,26 @@ def get_output_dir(lat, lon, nb_cells, output_name=None):
     lon_str = f"{lon:.6f}".rstrip('0').rstrip('.')
     return os.path.join("output", f"{lat_str}_{lon_str}_{nb_cells}x{nb_cells}")
 
+def layer_cell_path(output_dir, col, row, suffix):
+    return os.path.join(output_dir, f"{col},{row}_{suffix}.png")
+
+def cell_layers_complete(output_dir, col, row):
+    return all(
+        os.path.isfile(layer_cell_path(output_dir, col, row, suffix))
+        and os.path.getsize(layer_cell_path(output_dir, col, row, suffix)) > 0
+        for suffix in LAYER_SUFFIXES
+    )
+
 def cell_paths(output_dir, veg_output_dir, col, row):
     map_path = os.path.join(output_dir, f"{col},{row}.png")
     veg_path = os.path.join(veg_output_dir, f"{col},{row}_veg.png")
     return map_path, veg_path
 
-def cell_is_complete(map_path, veg_path):
+def cell_is_complete(map_path, veg_path, output_dir, col, row):
     return (
         os.path.isfile(map_path) and os.path.getsize(map_path) > 0
         and os.path.isfile(veg_path) and os.path.getsize(veg_path) > 0
+        and cell_layers_complete(output_dir, col, row)
     )
 
 def count_complete_cells(output_dir, veg_output_dir, nb_cells):
@@ -658,12 +776,12 @@ def count_complete_cells(output_dir, veg_output_dir, nb_cells):
     for row in range(nb_cells):
         for col in range(nb_cells):
             map_path, veg_path = cell_paths(output_dir, veg_output_dir, col, row)
-            if cell_is_complete(map_path, veg_path):
+            if cell_is_complete(map_path, veg_path, output_dir, col, row):
                 complete += 1
     return complete
 
 def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, status_label,
-                      resume=False, output_name=None, render_trains=False, snap_roads_45=False):
+                      resume=False, output_name=None, render_trains=False):
     try:
         output_base = get_output_dir(lat, lon, nb_cells, output_name)
         os.makedirs(output_base, exist_ok=True)
@@ -683,6 +801,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         print(f"Download zone: {download_zone_m:.0f}m x {download_zone_m:.0f}m")
 
         print("Downloading road network...")
+        configure_osmnx_way_tags()
         simplify_roads = dist > 5000
         G = ox.graph_from_point((lat, lon), dist=dist, network_type='all',
                                 simplify=simplify_roads, retain_all=True, truncate_by_edge=True)
@@ -722,9 +841,19 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         total_bbox = box(xmin, ymin, xmax, ymax)
         gdf_features_utm = gdf_features_utm.clip(total_bbox)
         gdf_edges_utm = gdf_edges_utm.clip(total_bbox)
-        if snap_roads_45:
-            print("Snapping roads to nearest 45° bearings...")
-            gdf_edges_utm = snap_roads_gdf_to_45(gdf_edges_utm)
+        sidewalk_counts = count_sidewalk_tagged_vehicle_roads(gdf_edges_utm)
+        print(
+            "Vehicle roads with OSM sidewalk tags: "
+            f"both/separate={sidewalk_counts['both']}, "
+            f"left={sidewalk_counts['left']}, "
+            f"right={sidewalk_counts['right']}"
+        )
+        if sum(sidewalk_counts.values()) == 0:
+            print(
+                "No sidewalk-tagged vehicle roads in this area. Sidewalk layers will be empty "
+                "unless OSM maps sidewalks on the road itself (sidewalk=*). "
+                "Many areas only map sidewalks as separate footways."
+            )
         del gdf_edges, gdf_features
         gc.collect()
 
@@ -737,8 +866,12 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
 
         polys, lines = prepare_feature_layers(gdf_features_utm)
         gdf_railways_utm = prepare_railway_lines(gdf_features_utm) if render_trains else None
+        canal_polys, canal_lines = prepare_canal_layers(gdf_features_utm)
         railway_count = len(gdf_railways_utm) if gdf_railways_utm is not None else 0
-        print(f"Prepared {len(polys)} polygons, {len(lines)} lines, {len(gdf_edges_utm)} roads, {railway_count} railways")
+        print(
+            f"Prepared {len(polys)} polygons, {len(lines)} lines, {len(gdf_edges_utm)} roads, "
+            f"{len(canal_lines)} canal lines, {len(canal_polys)} canal polygons, {railway_count} railways"
+        )
 
         output_dir = os.path.join(output_base, "map_cells")
         veg_output_dir = os.path.join(output_base, "map_vegetation")
@@ -765,7 +898,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                 cell_index = row * nb_cells + col + 1
                 map_cell_path, veg_cell_path = cell_paths(output_dir, veg_output_dir, col, row)
 
-                if resume and cell_is_complete(map_cell_path, veg_cell_path):
+                if resume and cell_is_complete(map_cell_path, veg_cell_path, output_dir, col, row):
                     status_label.config(
                         text=f"Skipped cell {cell_index}/{total_cells} ({col},{row}) — already done",
                         fg="orange"
@@ -784,7 +917,11 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                 cell_polys = filter_gdf_by_box(polys, cell_bbox)
                 cell_lines = filter_gdf_by_box(lines, cell_bbox)
                 cell_roads = get_roads_for_cell(gdf_edges_utm, cell_bbox)
+                cell_layer_roads = get_roads_for_cell(gdf_edges_utm, cell_bbox, vehicle_roads_only=True)
+                cell_footpaths = get_roads_for_cell(gdf_edges_utm, cell_bbox, pedestrian_only=True)
                 cell_railways = filter_gdf_by_box(gdf_railways_utm, cell_bbox) if render_trains else None
+                cell_canal_polys = filter_gdf_by_box(canal_polys, cell_bbox)
+                cell_canal_lines = filter_gdf_by_box(canal_lines, cell_bbox)
 
                 if resume and os.path.isfile(map_cell_path) and os.path.getsize(map_cell_path) > 0:
                     print(f"Reusing map tile for ({col},{row}), generating vegetation only")
@@ -792,8 +929,18 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                     render_cell(
                         map_cell_path, cell_xmin, cell_ymin, cell_xmax, cell_ymax,
                         cell_polys, cell_lines, cell_roads, meters_per_pixel, road_width_scale,
-                        cell_railways, render_trains, snap_roads_45,
+                        cell_railways, render_trains,
                     )
+
+                layers_needed = not resume or not cell_layers_complete(output_dir, col, row)
+                if layers_needed:
+                    for layer_name in LAYER_SUFFIXES:
+                        layer_path = layer_cell_path(output_dir, col, row, layer_name)
+                        render_layer_cell(
+                            layer_path, cell_xmin, cell_ymin, cell_xmax, cell_ymax, layer_name,
+                            cell_layer_roads, meters_per_pixel, road_width_scale,
+                            cell_canal_polys, cell_canal_lines, cell_footpaths,
+                        )
 
                 with Image.open(map_cell_path) as cell_img:
                     veg_array = classify_vegetation_color_vectorized(np.array(cell_img.convert('RGB')))
@@ -809,7 +956,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
                     gc.collect()
                 root.update()
 
-        del polys, lines, gdf_railways_utm, gdf_features_utm, gdf_edges_utm
+        del polys, lines, gdf_railways_utm, gdf_features_utm, gdf_edges_utm, canal_polys, canal_lines
         gc.collect()
 
         complete_map_filename = os.path.join(output_base, "complete_map.png")
@@ -821,6 +968,12 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
             root.update()
             stitch_cells(output_dir, nb_cells, lambda c, r: f"{c},{r}.png", complete_map_filename)
             stitch_cells(veg_output_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", complete_veg_filename)
+            for suffix in LAYER_SUFFIXES:
+                complete_layer_path = os.path.join(output_base, f"complete_{suffix}.png")
+                stitch_cells(
+                    output_dir, nb_cells, lambda c, r, s=suffix: f"{c},{r}_{s}.png", complete_layer_path,
+                )
+                print(f"Complete layer saved: {complete_layer_path}")
             print(f"Complete map saved: {complete_map_filename}")
             print(f"Complete vegetation map saved: {complete_veg_filename}")
         elif total_map_px > MAX_COMPLETE_MAP_PX:
@@ -857,7 +1010,7 @@ def generate_vegetation_maps(lat, lon, nb_cells, status_label, output_name=None)
             shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
 
-        filenames = [f for f in os.listdir(input_dir) if f.endswith(".png")]
+        filenames = [f for f in os.listdir(input_dir) if re.match(r'^\d+,\d+\.png$', f)]
         total_files = len(filenames)
         print(f"Vegetation: found {total_files} files to process.")
 
@@ -988,22 +1141,24 @@ def add_entry(label_text, default_value, row, tooltip=None):
         entry.bind("<Leave>", on_leave)
     return entry
 
-lat_entry = add_entry("Latitude:", 47.80328791813283, 0, "Latitude of the map center point.")
-lon_entry = add_entry("Longitude:", -3.7209986709586205, 1, "Longitude of the map center point.")
-cells_entry = add_entry("Number of cells (NxN):", 2, 2,
+saved_settings = load_settings()
+
+lat_entry = add_entry("Latitude:", saved_settings['latitude'], 0, "Latitude of the map center point.")
+lon_entry = add_entry("Longitude:", saved_settings['longitude'], 1, "Longitude of the map center point.")
+cells_entry = add_entry("Number of cells (NxN):", saved_settings['nb_cells'], 2,
                         "Number of cells per side (e.g., 2 means 4 map tiles).")
-margin_entry = add_entry("Download margin (%):", 0.8, 3,
+margin_entry = add_entry("Download margin (%):", saved_settings['margin_factor'], 3,
                          "Extra download buffer as % of map size (300m–2500m; large maps use the cap).")
-width_entry = add_entry("Road width scale:", 100, 4,
+width_entry = add_entry("Road width scale:", saved_settings['road_width_scale'], 4,
                         "Scale factor for road widths on the generated maps.")
-output_name_entry = add_entry("Output folder name:", "", 5,
+output_name_entry = add_entry("Output folder name:", saved_settings['output_name'], 5,
                               "Optional name under output/. Leave blank for lat_lon_NxN naming.")
 
 for entry in (lat_entry, lon_entry, cells_entry, margin_entry):
     entry.bind('<KeyRelease>', schedule_preview_update)
 schedule_preview_update()
 
-resume_var = tk.BooleanVar(value=False)
+resume_var = tk.BooleanVar(value=saved_settings['resume'])
 resume_frame = tk.Frame(frame)
 resume_frame.grid(row=6, column=0, columnspan=2, sticky='w')
 resume_label = tk.Label(resume_frame, text="Resume incomplete generation")
@@ -1017,7 +1172,7 @@ for widget in (resume_frame, resume_label, resume_check):
     ))
     widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
 
-trains_var = tk.BooleanVar(value=False)
+trains_var = tk.BooleanVar(value=saved_settings['render_trains'])
 trains_frame = tk.Frame(frame)
 trains_frame.grid(row=7, column=0, columnspan=2, sticky='w')
 trains_label = tk.Label(trains_frame, text="Render train lines")
@@ -1031,20 +1186,6 @@ for widget in (trains_frame, trains_label, trains_check):
     ))
     widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
 
-snap_roads_var = tk.BooleanVar(value=False)
-snap_roads_frame = tk.Frame(frame)
-snap_roads_frame.grid(row=8, column=0, columnspan=2, sticky='w')
-snap_roads_label = tk.Label(snap_roads_frame, text="Snap roads to 45° (experimental)")
-snap_roads_label.pack(side='left')
-snap_roads_check = tk.Checkbutton(snap_roads_frame, variable=snap_roads_var)
-snap_roads_check.pack(side='left')
-for widget in (snap_roads_frame, snap_roads_label, snap_roads_check):
-    widget.bind("<Enter>", lambda e: status_label.config(
-        text="Experimental: align roads to 0°/45°/90° bearings for PZ-style isometric building placement.",
-        fg="gray",
-    ))
-    widget.bind("<Leave>", lambda e: status_label.config(text="", fg="green"))
-
 def on_generate_maps():
     try:
         lat = float(lat_entry.get())
@@ -1054,15 +1195,14 @@ def on_generate_maps():
         width_scale = float(width_entry.get())
         resume = resume_var.get()
         render_trains = trains_var.get()
-        snap_roads_45 = snap_roads_var.get()
         output_name = output_name_entry.get()
         if n < 1:
             raise ValueError("Number of cells must be ≥ 1")
         if margin < 0:
             raise ValueError("Margin must be ≥ 0")
+        save_settings(collect_gui_settings())
         generate_map_grid(lat, lon, n, width_scale, margin, status_label,
-                          resume=resume, output_name=output_name, render_trains=render_trains,
-                          snap_roads_45=snap_roads_45)
+                          resume=resume, output_name=output_name, render_trains=render_trains)
     except Exception as e:
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
@@ -1078,8 +1218,13 @@ def on_generate_vegetation():
         showerror("Error", f"Invalid parameter: {e}")
         status_label.config(text="Parameter error.", fg="red")
 
-tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=9, column=0, columnspan=2, pady=5)
+tk.Button(frame, text="Generate Maps + Vegetation", command=on_generate_maps).grid(row=8, column=0, columnspan=2, pady=5)
 
+def on_close():
+    save_settings(collect_gui_settings())
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
 root.update_idletasks()
 root.minsize(PREVIEW_WIDTH + 40, root.winfo_height())
 

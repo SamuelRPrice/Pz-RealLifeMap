@@ -4,5 +4,8 @@ output/
 # Cache files
 cache/
 
+# Local user settings
+last_settings.json
+
 # Cringe MacOS file
 .DS_Store
