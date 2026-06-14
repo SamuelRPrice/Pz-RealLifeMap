@@ -80,15 +80,20 @@ def validate_output_dir(output_base):
         raise FileNotFoundError(f"Output folder not found: {output_base}")
 
     cells_dir = os.path.join(output_base, "map_cells")
-    veg_dir = os.path.join(output_base, "map_vegetation")
     main_path = os.path.join(output_base, "complete_map.png")
     if not os.path.isfile(main_path) and not os.path.isdir(cells_dir):
         raise FileNotFoundError(
             f"No map data in '{output_base}'. Expected complete_map.png or map_cells/."
         )
-    if not os.path.isfile(os.path.join(output_base, "complete_map_veg.png")) and not os.path.isdir(veg_dir):
+    has_veg = (
+        os.path.isfile(os.path.join(output_base, "complete_map_veg.png"))
+        or any(name.endswith("_veg.png") for name in os.listdir(cells_dir))
+        if os.path.isdir(cells_dir) else False
+    )
+    if not has_veg:
         raise FileNotFoundError(
-            f"No vegetation data in '{output_base}'. Expected complete_map_veg.png or map_vegetation/."
+            f"No vegetation data in '{output_base}'. Expected complete_map_veg.png or "
+            f"*_veg.png files in map_cells/."
         )
     return output_base
 
@@ -167,7 +172,6 @@ def run_cli(args):
     )
     print(f"Wrote {result['tmx_count']} TMX files to: {result['export_dir']}")
     print(f"World file: {result['pzw_path']}")
-    print(f"WorldEd copy: {result['pzw_worlded_path']}")
     return result
 
 

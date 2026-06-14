@@ -759,9 +759,9 @@ def cell_layers_complete(output_dir, col, row):
         for suffix in LAYER_SUFFIXES
     )
 
-def cell_paths(output_dir, veg_output_dir, col, row):
+def cell_paths(output_dir, col, row):
     map_path = os.path.join(output_dir, f"{col},{row}.png")
-    veg_path = os.path.join(veg_output_dir, f"{col},{row}_veg.png")
+    veg_path = os.path.join(output_dir, f"{col},{row}_veg.png")
     return map_path, veg_path
 
 def cell_is_complete(map_path, veg_path, output_dir, col, row):
@@ -771,11 +771,11 @@ def cell_is_complete(map_path, veg_path, output_dir, col, row):
         and cell_layers_complete(output_dir, col, row)
     )
 
-def count_complete_cells(output_dir, veg_output_dir, nb_cells):
+def count_complete_cells(output_dir, nb_cells):
     complete = 0
     for row in range(nb_cells):
         for col in range(nb_cells):
-            map_path, veg_path = cell_paths(output_dir, veg_output_dir, col, row)
+            map_path, veg_path = cell_paths(output_dir, col, row)
             if cell_is_complete(map_path, veg_path, output_dir, col, row):
                 complete += 1
     return complete
@@ -874,19 +874,16 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         )
 
         output_dir = os.path.join(output_base, "map_cells")
-        veg_output_dir = os.path.join(output_base, "map_vegetation")
         if resume:
             os.makedirs(output_dir, exist_ok=True)
-            os.makedirs(veg_output_dir, exist_ok=True)
         else:
-            for dir_name in [output_dir, veg_output_dir]:
-                if os.path.exists(dir_name):
-                    shutil.rmtree(dir_name)
-                os.makedirs(dir_name, exist_ok=True)
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
 
         total_cells = nb_cells * nb_cells
         if resume:
-            existing_cells = count_complete_cells(output_dir, veg_output_dir, nb_cells)
+            existing_cells = count_complete_cells(output_dir, nb_cells)
             print(f"Resume mode: {existing_cells}/{total_cells} cells already complete")
 
         status_label.config(text="Rendering map cells...", fg="orange")
@@ -896,7 +893,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         for row in range(nb_cells):
             for col in range(nb_cells):
                 cell_index = row * nb_cells + col + 1
-                map_cell_path, veg_cell_path = cell_paths(output_dir, veg_output_dir, col, row)
+                map_cell_path, veg_cell_path = cell_paths(output_dir, col, row)
 
                 if resume and cell_is_complete(map_cell_path, veg_cell_path, output_dir, col, row):
                     status_label.config(
@@ -961,13 +958,13 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
 
         complete_map_filename = os.path.join(output_base, "complete_map.png")
         complete_veg_filename = os.path.join(output_base, "complete_map_veg.png")
-        complete_cells = count_complete_cells(output_dir, veg_output_dir, nb_cells)
+        complete_cells = count_complete_cells(output_dir, nb_cells)
         if total_map_px <= MAX_COMPLETE_MAP_PX and complete_cells == total_cells:
             status_label.config(text="Stitching complete preview maps...", fg="orange")
             print("Step 5: Stitching complete preview maps...")
             root.update()
             stitch_cells(output_dir, nb_cells, lambda c, r: f"{c},{r}.png", complete_map_filename)
-            stitch_cells(veg_output_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", complete_veg_filename)
+            stitch_cells(output_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", complete_veg_filename)
             for suffix in LAYER_SUFFIXES:
                 complete_layer_path = os.path.join(output_base, f"complete_{suffix}.png")
                 stitch_cells(
@@ -979,7 +976,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
         elif total_map_px > MAX_COMPLETE_MAP_PX:
             print(
                 f"Skipping complete preview maps ({total_map_px}px exceeds {MAX_COMPLETE_MAP_PX}px limit). "
-                f"Individual tiles are in '{output_dir}' and '{veg_output_dir}'."
+                f"Individual tiles are in '{output_dir}'."
             )
         else:
             print(
@@ -988,7 +985,7 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
             )
 
         status_label.config(text=f"{nb_cells}x{nb_cells} grids generated in '{output_base}'.", fg="#004d00")
-        print(f"Map grid generation completed: {complete_cells}/{total_cells} tiles in '{output_dir}' and '{veg_output_dir}'.")
+        print(f"Map grid generation completed: {complete_cells}/{total_cells} tiles in '{output_dir}'.")
 
     except Exception as e:
         showerror("Error", f"Map generation error: {e}")
@@ -998,19 +995,15 @@ def generate_map_grid(lat, lon, nb_cells, road_width_scale, margin_factor, statu
 def generate_vegetation_maps(lat, lon, nb_cells, status_label, output_name=None):
     try:
         output_base = get_output_dir(lat, lon, nb_cells, output_name)
-        input_dir = os.path.join(output_base, "map_cells")
-        output_dir = os.path.join(output_base, "map_vegetation")
+        cells_dir = os.path.join(output_base, "map_cells")
 
-        if not os.path.isdir(input_dir):
-            raise FileNotFoundError(f"No map cells found in '{input_dir}'. Generate maps first.")
+        if not os.path.isdir(cells_dir):
+            raise FileNotFoundError(f"No map cells found in '{cells_dir}'. Generate maps first.")
 
         status_label.config(text="Starting vegetation map generation...", fg="orange")
         print("Vegetation: start processing images.")
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir)
-        os.makedirs(output_dir, exist_ok=True)
 
-        filenames = [f for f in os.listdir(input_dir) if re.match(r'^\d+,\d+\.png$', f)]
+        filenames = [f for f in os.listdir(cells_dir) if re.match(r'^\d+,\d+\.png$', f)]
         total_files = len(filenames)
         print(f"Vegetation: found {total_files} files to process.")
 
@@ -1019,16 +1012,16 @@ def generate_vegetation_maps(lat, lon, nb_cells, status_label, output_name=None)
             print(f"Vegetation: processing {filename} ({idx}/{total_files})")
             root.update()
 
-            path = os.path.join(input_dir, filename)
+            path = os.path.join(cells_dir, filename)
             img = Image.open(path).convert("RGB")
             img_array = np.array(img)
             new_array = classify_vegetation_color_vectorized(img_array)
 
             base, _ = os.path.splitext(filename)
-            Image.fromarray(new_array).save(os.path.join(output_dir, f"{base}_veg.png"))
+            Image.fromarray(new_array).save(os.path.join(cells_dir, f"{base}_veg.png"))
 
-        status_label.config(text=f"Vegetation maps generated in '{output_dir}'.", fg="#004d00")
-        print(f"Vegetation: generation completed, saved in '{output_dir}'.")
+        status_label.config(text=f"Vegetation maps generated in '{cells_dir}'.", fg="#004d00")
+        print(f"Vegetation: generation completed, saved in '{cells_dir}'.")
 
     except Exception as e:
         showerror("Error", f"Vegetation generation error: {e}")

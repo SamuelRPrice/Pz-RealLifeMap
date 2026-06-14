@@ -15,48 +15,26 @@ DEFAULT_WORLDED_PATH = (
     r"C:\Users\Sam\Documents\projects\zomboid mapping\pz-tools-ce_42_16_rev3"
 )
 WORLDED_EXE = os.path.join("WorldEd", "PZWorldEd.exe")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BUNDLED_TMX_SKELETON = os.path.join(_SCRIPT_DIR, "worlded_data", "tmx_cell_skeleton.xml")
 
 _skeleton_cache = {}
 
 
-def find_reference_tmx(worlded_dir):
-    maps_dir = os.path.join(worlded_dir, "maps")
-    if not os.path.isdir(maps_dir):
-        return None
-    for root, _dirs, files in os.walk(maps_dir):
-        if "complete_map_0_0.tmx" in files:
-            return os.path.join(root, "complete_map_0_0.tmx")
-    for root, _dirs, files in os.walk(maps_dir):
-        for name in sorted(files):
-            if name.endswith(".tmx"):
-                return os.path.join(root, name)
-    return None
+def _rel_path(from_dir, target):
+    return os.path.relpath(os.path.abspath(target), os.path.abspath(from_dir)).replace("\\", "/")
 
 
-def get_tmx_skeleton(worlded_dir, export_dir):
-    cache_key = (os.path.normcase(worlded_dir), os.path.normcase(export_dir))
-    if cache_key in _skeleton_cache:
-        return _skeleton_cache[cache_key]
-
-    ref_path = find_reference_tmx(worlded_dir)
-    if not ref_path:
+def build_tmx_skeleton(worlded_dir, export_dir):
+    if not os.path.isfile(BUNDLED_TMX_SKELETON):
         raise FileNotFoundError(
-            f"No reference .tmx found under {maps_dir_path(worlded_dir)}. "
-            "Run WorldEd BMP-to-TMX once on any map to create a template."
+            f"Bundled TMX skeleton not found: {BUNDLED_TMX_SKELETON}"
         )
 
-    with open(ref_path, encoding="utf-8") as ref_file:
-        content = ref_file.read()
+    with open(BUNDLED_TMX_SKELETON, encoding="utf-8") as skeleton_file:
+        skeleton = skeleton_file.read().rstrip() + "\n"
 
-    marker = "<bmp-image"
-    split_at = content.find(marker)
-    if split_at == -1:
-        raise ValueError(f"Reference TMX is missing bmp-image data: {ref_path}")
-
-    skeleton = content[:split_at].rstrip() + "\n"
-    worlded_rel = os.path.relpath(
-        os.path.join(worlded_dir, "WorldEd"), export_dir
-    ).replace("\\", "/")
+    worlded_rel = _rel_path(export_dir, os.path.join(worlded_dir, "WorldEd"))
     skeleton = re.sub(
         r'(<rules-file file=")[^"]*(")',
         rf'\g<1>{worlded_rel}/Rules.txt\2',
@@ -69,6 +47,15 @@ def get_tmx_skeleton(worlded_dir, export_dir):
         skeleton,
         count=1,
     )
+    return skeleton
+
+
+def get_tmx_skeleton(worlded_dir, export_dir):
+    cache_key = (os.path.normcase(worlded_dir), os.path.normcase(export_dir))
+    if cache_key in _skeleton_cache:
+        return _skeleton_cache[cache_key]
+
+    skeleton = build_tmx_skeleton(worlded_dir, export_dir)
 
     _skeleton_cache[cache_key] = skeleton
     return skeleton
@@ -94,12 +81,11 @@ def ensure_complete_maps(output_base, nb_cells):
     main_path = os.path.join(output_base, "complete_map.png")
     veg_path = os.path.join(output_base, "complete_map_veg.png")
     cells_dir = os.path.join(output_base, "map_cells")
-    veg_dir = os.path.join(output_base, "map_vegetation")
 
     if not os.path.isfile(main_path):
         stitch_cell_grid(cells_dir, nb_cells, lambda c, r: f"{c},{r}.png", main_path)
     if not os.path.isfile(veg_path):
-        stitch_cell_grid(veg_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", veg_path)
+        stitch_cell_grid(cells_dir, nb_cells, lambda c, r: f"{c},{r}_veg.png", veg_path)
     return main_path, veg_path
 
 
@@ -197,10 +183,6 @@ def generate_tmx_grid(main_image_path, veg_image_path, nb_cells, export_dir, wor
     return written
 
 
-def _rel_path(from_dir, target):
-    return os.path.relpath(os.path.abspath(target), os.path.abspath(from_dir)).replace("\\", "/")
-
-
 def write_pzw(world_path, worlded_dir, export_dir, main_image_path, nb_cells,
               world_origin=(0, 0), prefix="complete_map"):
     template_path = os.path.join(worlded_dir, "WorldEd", "test", "untitled.pzw")
@@ -292,12 +274,8 @@ def generate_worlded_output(output_base, nb_cells, worlded_dir, world_name=None,
         status_callback=tmx_status,
     )
 
-    pzw_name = f"{world_name}.pzw"
-    pzw_path = os.path.join(os.path.abspath(output_base), pzw_name)
+    pzw_path = os.path.join(export_dir, f"{world_name}.pzw")
     write_pzw(pzw_path, worlded_dir, export_dir, main_path, nb_cells)
-
-    worlded_copy = os.path.join(worlded_dir, "WorldEd", "test", pzw_name)
-    write_pzw(worlded_copy, worlded_dir, export_dir, main_path, nb_cells)
 
     if open_worlded:
         launch_worlded(worlded_dir, pzw_path)
@@ -306,7 +284,6 @@ def generate_worlded_output(output_base, nb_cells, worlded_dir, world_name=None,
         "tmx_count": count,
         "export_dir": export_dir,
         "pzw_path": pzw_path,
-        "pzw_worlded_path": worlded_copy,
         "main_map": main_path,
         "veg_map": veg_path,
     }
