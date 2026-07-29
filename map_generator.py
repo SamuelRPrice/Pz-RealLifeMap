@@ -49,8 +49,8 @@ VEGETATION_COLORS = {
     'light_long_grass': (0, 255, 0),
 }
 
-CELL_SIZE_M = 300
-CELL_PX = 300
+CELL_SIZE_M = 256
+CELL_PX = 256
 RENDER_DPI = 100
 # Skip stitching full preview images above this side length (~1.2 GB RGB at 20k px).
 MAX_COMPLETE_MAP_PX = 20000
